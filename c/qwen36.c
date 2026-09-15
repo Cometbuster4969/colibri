@@ -2864,7 +2864,10 @@ static void serve_one(Model *m, ServeReq *q){
     hits_emit(m);
     {
         double disk=m->t_disk-s_disk, moe=tm_sum(2)-s_moe;
-        printf("PROF %.3f %d %d %.3f %.3f %.3f %.3f %.3f %llu\n", dt, np, gen,
+        /* microsecond resolution: a tiny-fixture turn on a fast runner is under
+         * a millisecond, and at %.3f every phase (and the wall) printed 0.000,
+         * which the dashboard tests read as "not measured" (dev CI, 2026-09-14) */
+        printf("PROF %.6f %d %d %.6f %.6f %.6f %.6f %.6f %llu\n", dt, np, gen,
                disk, 0.0, moe>disk?moe-disk:0.0, tm_sum(0)+tm_sum(1)-s_attn, tm_sum(5)-s_head,
                (unsigned long long)forwards);   /* contati, non dedotti: l'ultimo token non ne fa uno */
         fflush(stdout);

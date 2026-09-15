@@ -66,7 +66,11 @@ Both optimizations are bit-exact and on by default.  For controlled A/Bs,
 Requirements: ~30 GB RAM for comfortable expert caching and NVMe storage for
 the container. The default build is CPU-only; `make -C c qwen36 CUDA=1` adds
 the optional CUDA VRAM expert tier documented in
-[`qwen36-cuda-tier.md`](qwen36-cuda-tier.md).
+[`qwen36-cuda-tier.md`](qwen36-cuda-tier.md). The same tier builds for AMD
+through ROCm with `make -C c qwen36 HIP=1 HIP_ARCH=<gfx>` (for example
+`HIP_ARCH=gfx1151`, with `ROCM_HOME` and `HIPCC` pointing at the toolchain):
+measured on a Ryzen AI MAX+ 395, output bit-identical to the CPU path and 2.4x
+faster than CPU-only (#1502).
 
 ## The expert kernel
 

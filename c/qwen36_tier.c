@@ -319,7 +319,7 @@ static struct { ColiCudaTensor *t; int dev, on; } G_dnp[QT_DN_MAX_LAYERS];
  * which the hand-written list never did (the 0.7 GB above was the
  * discovery). COLI_PLACE=off keeps today's behaviour: nothing placed. */
 #define QT_OFFER_MAX 1024
-static struct { char name[16]; int layer; size_t bytes; } G_offer[QT_OFFER_MAX];
+static struct { char name[16]; int layer; size_t bytes; int dev; } G_offer[QT_OFFER_MAX];
 static int G_offer_n;
 static int G_auto_on;                                  /* auto placement decided */
 static int G_auto_lmh = QT_PLACE_CPU;
@@ -328,10 +328,12 @@ static size_t G_trunk_bytes[QT_MAX_DEV];               /* placed trunk per devic
 
 int qt_place_of(const char *component, int layer){
     if(G_auto_on){
-        if(!strcmp(component, "lmhead")) return G_auto_lmh;
-        if(!strcmp(component, "dnproj"))
-            return (layer >= 0 && layer < QT_DN_MAX_LAYERS) ? G_auto_dnp[layer] : QT_PLACE_CPU;
-        return QT_PLACE_CPU;               /* experts follow COLI_GPUS; dnout/attnproj not yet placed */
+        /* the decision lives on the offer: any component name an engine
+         * offered can be asked for (lmhead/dnproj for qwen36, the trunk
+         * matrices of qwen38 by their own names) */
+        for(int o = 0; o < G_offer_n; o++)
+            if(G_offer[o].layer == layer && !strcmp(G_offer[o].name, component)) return G_offer[o].dev;
+        return QT_PLACE_CPU;               /* experts follow COLI_GPUS */
     }
     if(!G_place_done) place_parse();
     for(int i = 0; i < G_place_n; i++){
@@ -353,7 +355,7 @@ void qt_trunk_offer(const char *component, int layer, size_t bytes){
     if(!component || !bytes || G_offer_n >= QT_OFFER_MAX) return;
     if(layer < 0 || layer >= QT_DN_MAX_LAYERS) return;
     snprintf(G_offer[G_offer_n].name, sizeof G_offer[0].name, "%s", component);
-    G_offer[G_offer_n].layer = layer; G_offer[G_offer_n].bytes = bytes;
+    G_offer[G_offer_n].layer = layer; G_offer[G_offer_n].bytes = bytes; G_offer[G_offer_n].dev = QT_PLACE_CPU;
     G_offer_n++;
 }
 
@@ -414,11 +416,15 @@ static void auto_place(int nl, int ne, int topk, const size_t *capacity, const u
     int placed = 0, kept = 0;
     /* lmhead first (one call per token, latency-tolerant), then the
      * projections in layer order */
+    for(int o = 0; o < G_offer_n; o++) G_offer[o].dev = QT_PLACE_CPU;
+    /* lmhead first (one call per token, latency-tolerant), then every other
+     * offered component in offer order -- the engine offers in layer order,
+     * so a partial placement is a prefix of the layers (#1361: whole
+     * layers, never a slice of the stream) */
     for(int pass = 0; pass < 2; pass++)
         for(int o = 0; o < G_offer_n; o++){
             int is_lmh = !strcmp(G_offer[o].name, "lmhead");
             if((pass == 0) != is_lmh) continue;
-            if(!is_lmh && strcmp(G_offer[o].name, "dnproj")) continue;   /* v1: these two */
             size_t bytes = G_offer[o].bytes;
             int di = 0;
             for(int i = 1; i < G.ndev; i++) if(room[i] > room[di]) di = i;
@@ -432,7 +438,9 @@ static void auto_place(int nl, int ne, int topk, const size_t *capacity, const u
                         G_offer[o].name, G_offer[o].layer, bytes/1048576.0, k, lose/1048576.0, G.dev[di], pm);
                 kept++; continue;
             }
-            if(is_lmh) G_auto_lmh = G.dev[di]; else G_auto_dnp[G_offer[o].layer] = G.dev[di];
+            G_offer[o].dev = G.dev[di];
+            if(is_lmh) G_auto_lmh = G.dev[di];
+            else if(!strcmp(G_offer[o].name, "dnproj")) G_auto_dnp[G_offer[o].layer] = G.dev[di];
             room[di] -= bytes; G_trunk_bytes[di] += bytes; placed++;
         }
     G_auto_on = 1;
@@ -457,6 +465,7 @@ static void auto_place(int nl, int ne, int topk, const size_t *capacity, const u
  * expert, now in hand, hotter than the coldest resident on its device? */
 static int G_fp8_stream;
 static const float *G_fp8_lut;
+static int G_upload_sync;             /* QT_UPLOAD_SYNC=1: qt_issue waits for in-flight uploads first (tests) */
 
 int qt_init_fp8(int nl, int ne, int D, int Ih, int cap, int topk, const float *e4m3_lut){
     G_fp8_stream = 1; G_fp8_lut = e4m3_lut;
@@ -493,6 +502,7 @@ int qt_init(int nl, int ne, int D, int Ih, int cap, int topk, int expert_gs,
     }
     if(topk>QT_MAX_ROWS){ fprintf(stderr,"[qtier] topk>%d unsupported\n",QT_MAX_ROWS); return 0; }
     memset(&G,0,sizeof G);
+    { const char *e=getenv("QT_UPLOAD_SYNC"); G_upload_sync=e&&*e&&*e!='0'; }
     G.nl=nl; G.ne=ne; G.D=D; G.Ih=Ih; G.topk=topk;
     /* Placement state is re-derived per init: the device fold-in below reads
      * COLI_PLACE before the automatic placement has decided anything, and a
@@ -710,6 +720,11 @@ int qt_init(int nl, int ne, int D, int Ih, int cap, int topk, int expert_gs,
     G.on=1;
     fprintf(stderr,"[qtier] CUDA VRAM expert tier active: %d device(s), %.2f MB/expert\n",
             G.ndev, G.exp_bytes/1048576.0);
+    /* The launcher and coli doctor recognise a Windows CUDA_DLL build by this
+     * literal in the binary (they cannot read an import table for a DLL
+     * loaded at run time); without it a working GPU build of this engine read
+     * as CPU-only and --gpu was refused (#1533). */
+    fprintf(stderr,"[CUDA] mode: routed experts (qwen36 VRAM tier)\n");
     return 1;
 }
 
@@ -741,6 +756,36 @@ int qt_dnproj_init(int layer, const int8_t *q, const float *sc,
     G_dnp[layer].dev = device; G_dnp[layer].on = 1;
     return 1;
 }
+
+/* ---- generic resident dense matrices (Qwen3.8 trunk) -----------------------
+ * Same mechanism as lmhead/dnproj -- an int8 per-row tensor resident on one
+ * device, one GEMV per call -- but addressed by a handle the engine keeps in
+ * its weight, so any matrix of any layer can live on the GPU without the
+ * tier learning its name. The engine offers sizes through qt_trunk_offer(),
+ * asks qt_place_of() where each went, and hands the quantized bytes here. */
+#define QT_DENSE_MAX 1024
+static struct { ColiCudaTensor *t; int dev, on; size_t bytes; } G_dense[QT_DENSE_MAX];
+static int G_dense_n;
+int qt_dense_init(const int8_t *q, const float *sc, int I, int O, int device){
+    if(device == QT_PLACE_CPU || !q || !sc || I <= 0 || O <= 0) return -1;
+    if(G_dense_n >= QT_DENSE_MAX) return -1;
+    int h = G_dense_n;
+    if(!coli_cuda_tensor_upload(&G_dense[h].t, q, sc, 1, I, O, device)){
+        fprintf(stderr,"[dense] upload [%d x %d] to dev %d failed -> stays on CPU\n", O, I, device);
+        return -1;
+    }
+    G_dense[h].dev = device; G_dense[h].on = 1; G_dense[h].bytes = (size_t)I*O + (size_t)O*sizeof(float);
+    G_dense_n++;
+    return h;
+}
+int qt_dense_matmul(int h, float *y, const float *x, int I, int O){
+    if(h < 0 || h >= G_dense_n || !G_dense[h].on) return 0;
+    if(coli_cuda_matmul(&G_dense[h].t, y, x, NULL, NULL, 1, 1, I, O, G_dense[h].dev, 0)) return 1;
+    fprintf(stderr,"[dense] handle %d GPU matmul failed; CPU from here on\n", h);
+    G_dense[h].on = 0;
+    return 0;
+}
+int qt_dense_count(void){ return G_dense_n; }
 
 int qt_dnproj_matmul(int layer, float *y, const float *x, int I, int O){
     if(layer < 0 || layer >= QT_DN_MAX_LAYERS || !G_dnp[layer].on) return 0;
@@ -1006,6 +1051,14 @@ uint32_t qt_issue(int layer,const int *eids,int K,const float *x){
     for(int i=0;i<G.ndev;i++) G.is_cnt[i]=0;
 
     pthread_mutex_lock(&G.mx);
+    /* QT_UPLOAD_SYNC=1: everything enqueued so far is resident before this
+     * group is formed. Costs the upload/compute overlap, so it is for tests
+     * and diagnostics: the fake-backend engine test asserts on residency and
+     * hits after eight tokens, and on a two-vCPU runner the uploader thread
+     * did not get scheduled once before the run was over (0 uploads, 0 hits,
+     * six entries still queued). No group is open here, so the wait cannot
+     * meet a swap parked on issue_open. */
+    if(G_upload_sync) while(G.inflight>0 && !G.th_stop) pthread_cond_wait(&G.cv_take,&G.mx);
     if(layer==0) qt_lfru_tick_locked();
     G.issue_open=1;
     for(int k=0;k<K;k++){
@@ -1079,7 +1132,12 @@ void qt_stats(void){
               (unsigned long long)calls,(unsigned long long)ex,h2d,kms,d2h); }
 }
 
+static void dense_free_all(void){
+    for(int h = 0; h < G_dense_n; h++){ if(G_dense[h].t) coli_cuda_tensor_free(G_dense[h].t); G_dense[h].t = NULL; G_dense[h].on = 0; }
+    G_dense_n = 0;
+}
 void qt_shutdown(void){
+    dense_free_all();
     if(!G.on) return;
     const char *hf=getenv("HEAT_FILE");
     if(hf){

@@ -3006,8 +3006,12 @@ static int serve_one(GModel *m, Tok *tokenizer, ServeReq *q) {
         return 0;
     }
     if (total >= room) {
+        /* The gateway turns CONTEXT_EXCEEDED into a 400 context_length_exceeded;
+         * BAD_REQUEST reads as an engine fault, a 500 the client cannot act on.
+         * tok_encode stops at `room`, so prompt_tokens is a lower bound. */
         free(sequence);
-        serve_line("ERROR %llu BAD_REQUEST\n", q->id);
+        serve_line("ERROR %llu CONTEXT_EXCEEDED prompt_tokens=%d requested=%d capacity=%d\n",
+                   q->id, total, q->max_tokens, room);
         return 0;
     }
 

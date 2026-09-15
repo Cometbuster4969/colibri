@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Authoritative model-family registry for Colibri's Python control plane."""
 
+import os
 from dataclasses import dataclass
 import json
 import math
@@ -89,6 +90,11 @@ class FamilyDescriptor:
     # separate from expert_inventory prevents a fixed allocation from
     # being multiplied by the cache capacity.
     fixed_resident_inventory: object = None
+    # Bytes of a dense tensor that the engine's GPU trunk offload would hold
+    # in VRAM (int8 per row, quantized at load time), so the planner can take
+    # the trunk out of the VRAM budget before it counts hot experts. None: the
+    # engine keeps its trunk on the CPU (or has none).
+    trunk_inventory: object = None
     # Lo script sotto tools/ che `coli convert` puo' guidare per questa famiglia,
     # e le opzioni di `coli convert` che quello script accetta davvero.
     #
@@ -168,15 +174,41 @@ def _glm_geometry(config, context, _model_dir):
     return PlannerGeometry(state, 0, workspace, experts)
 
 
+def _qwen36_layer_types(config, layers, model_dir):
+    """The per-layer kinds, from wherever this container wrote them. The HF
+    config carries `layer_types`; older converted containers carry them only in
+    qwen36_meta.json (the engine reads that file, which is why chat worked
+    while doctor and plan refused, #1532); and the upstream class derives them
+    from `full_attention_interval` when neither list is present."""
+    kinds = config.get("layer_types")
+    if isinstance(kinds, list) and len(kinds) == layers:
+        return kinds
+    if model_dir:
+        try:
+            with open(os.path.join(model_dir, "qwen36_meta.json"), encoding="utf-8") as handle:
+                meta = json.load(handle)
+        except (OSError, ValueError):
+            meta = None
+        if isinstance(meta, dict):
+            kinds = meta.get("layer_types")
+            if isinstance(kinds, list) and len(kinds) == layers:
+                return kinds
+    interval = config.get("full_attention_interval")
+    if isinstance(interval, int) and not isinstance(interval, bool) and interval >= 1:
+        return ["full_attention" if (i + 1) % interval == 0 else "linear_attention"
+                for i in range(layers)]
+    raise ValueError("qwen36: missing or invalid planning key 'layer_types' "
+                     "(not in config.json, no qwen36_meta.json with it, and no "
+                     "full_attention_interval to derive it from)")
+
+
 def _qwen36_geometry(config, context, _model_dir):
     """Hybrid: only the full_attention layers hold a KV cache; the linear
     (DeltaNet) layers carry a recurrent state whose size does not depend on the
     context at all. One scaled context term would over-promise on a model where
     30 of 40 layers never grow."""
     layers = _required_int(config, "num_hidden_layers", "qwen36")
-    kinds = config.get("layer_types")
-    if not isinstance(kinds, list) or len(kinds) != layers:
-        raise ValueError("qwen36: missing or invalid planning key 'layer_types'")
+    kinds = _qwen36_layer_types(config, layers, _model_dir)
     full = sum(kind == "full_attention" for kind in kinds)
     kv = (full * context * _required_int(config, "num_key_value_heads", "qwen36") *
           _required_int(config, "head_dim", "qwen36") * 2 * 4)
@@ -965,6 +997,28 @@ _QWEN38_NATIVE_MATRIX_SUFFIXES = (
 )
 
 
+def _qwen38_trunk_inventory(name, size, _config, dtype=None):
+    """int8 bytes the qwen38 engine's stage-1 trunk offload holds in VRAM for
+    this tensor (docs/qwen38.md, "GPU"): the dense matmul matrices of the text
+    model, quantized per row when the tier starts. Matrices under 1 MiB stay
+    on the CPU (a round trip costs more than a tiny GEMV saves), and so do
+    the PLE projections, the vision tower and everything that is not a matmul
+    weight. embed_tokens stands in for the tied lm_head."""
+    if name.startswith("mtp.") or name.startswith("model.visual.") or ".ple." in name:
+        return 0
+    text_tensor = (name == "lm_head.weight" or
+                   name.startswith("model.language_model.") or
+                   name.startswith("model."))
+    if not text_tensor or not name.endswith(_QWEN38_NATIVE_MATRIX_SUFFIXES):
+        return 0
+    dtype = "BF16" if dtype is None else dtype
+    element_bytes = {"BF16": 2, "F16": 2, "F32": 4}.get(dtype)
+    if not element_bytes:
+        return 0
+    elements = size // element_bytes
+    return elements if elements >= (1 << 20) else 0
+
+
 def _qwen38_resident_inventory(name, size, _config, dtype=None):
     """Resident bytes for tensors the native text engine actually loads.
 
@@ -1189,6 +1243,10 @@ FAMILIES = (
         planner_id="olmoe_gqa",
         planner_geometry=_olmoe_geometry,
         planner_unsupported_reason="",
+        # CPU-only, and olmoe.c says so in its own serve telemetry: "CPU-only (no
+        # CUDA/Metal backend), so the GPU fields are always empty". The build rule
+        # links NOCUDA_LDFLAGS. Left at the default this advertised a VRAM tier.
+        supports_accelerator=False,
         expert_inventory=_individual_expert_inventory(_GLM_EXPERT),
         config_section="root",
         # implicit_cap 0, not 8: the engine sizes its expert cache from the RAM
@@ -1268,7 +1326,11 @@ FAMILIES = (
             "and prioritize correctness, consistency, and clarity in the final answer."
             "<|im_end|>\n<|im_start|>user\n{prompt}<|im_end|>\n"
             "<|im_start|>assistant\n<think>\n"),
-        supports_accelerator=False,
+        # CUDA VRAM expert tier (qwen36_tier.c, fp8 streaming mode): hot
+        # routed experts get VRAM copies above the RAM LRU, and the dense
+        # trunk goes first, as int8 residents (docs/qwen38.md, "GPU").
+        supports_accelerator=True,
+        trunk_inventory=_qwen38_trunk_inventory,
     ),
     FamilyDescriptor(
         id="deepseek_v4",
@@ -1318,6 +1380,13 @@ FAMILIES = (
         planner_id="deepseek_v41",
         planner_geometry=_dsv41_geometry,
         planner_unsupported_reason="",
+        # CPU-only: the engine links no CUDA/Metal/Vulkan path and its build rule
+        # carries no backend object, so the planner must not offer a VRAM tier it
+        # cannot execute. Left at the default True it wrote "VRAM 296.0 GB hot
+        # tier ... 100% projected expert residency" into `coli plan` for this
+        # model; resource_plan.py:945 is the gate and says the same thing in
+        # words ("a CPU-only engine has no VRAM tier").
+        supports_accelerator=False,
         expert_inventory=_dsv41_expert_inventory,
         resident_inventory=_dsv41_resident_inventory,
         config_section="text_config",
@@ -1488,6 +1557,20 @@ def resident_contribution(resolved, name, size, dtype=None):
         name, size, resolved.family_config, dtype)
     if isinstance(contribution, bool) or not isinstance(contribution, int) or contribution < 0:
         raise RegistryError(f"invalid resident inventory for {resolved.descriptor.id}")
+    return contribution
+
+
+def trunk_contribution(resolved, name, size, dtype=None):
+    """VRAM bytes of the engine's dense-trunk offload for one tensor (0 for
+    families whose trunk stays on the CPU)."""
+    if isinstance(size, bool) or not isinstance(size, int) or size < 0:
+        raise ValueError("tensor size must be a non-negative integer")
+    inventory = resolved.descriptor.trunk_inventory
+    if inventory is None:
+        return 0
+    contribution = inventory(name, size, resolved.family_config, dtype)
+    if isinstance(contribution, bool) or not isinstance(contribution, int) or contribution < 0:
+        raise RegistryError(f"invalid trunk inventory for {resolved.descriptor.id}")
     return contribution
 
 

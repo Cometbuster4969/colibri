@@ -2102,12 +2102,19 @@ static void apply_rep_penalty(float *logit, int n, const int *hist, int nhist, f
     }
 }
 
-/* reject a prompt that would overrun the served KV bound (CTX_MAX, default 8192) */
+/* reject a prompt that would overrun the served KV bound (CTX_MAX, default 8192).
+ * The refusal is the frame the gateway turns into a 400 context_length_exceeded
+ * (#506, #1381); free text here reached the client as a 500. One request is
+ * served at a time, so the returned buffer is only read before the next call. */
 static const char *prompt_reject(int np, int want) {
+    static char message[96];
     const char *cm = getenv("CTX_MAX");
     int ctx_max = cm ? atoi(cm) : 8192;
-    if (np + want > ctx_max) return "context exceeds CTX_MAX";
-    return NULL;
+    if (np + want <= ctx_max) return NULL;
+    snprintf(message, sizeof(message),
+             "CONTEXT_EXCEEDED prompt_tokens=%d requested=%d capacity=%d",
+             np, want, ctx_max);
+    return message;
 }
 
 typedef struct { char id[64]; int max_tok; float temp, top_p; char *payload; int plen;
