@@ -74,6 +74,10 @@ TOOLS = [{"type": "function", "function": {
                    "required": ["location"]}}}]
 
 
+@unittest.skipUnless(os.name == "posix",
+                     "the mock engine is a shebang script the gateway execs directly; "
+                     "Windows CreateProcess cannot run it. The gateway logic under test "
+                     "is platform-independent and covered by the POSIX CI jobs.")
 class _FallbackBase(unittest.TestCase):
     """Boots the gateway for one arch, with COLI_TOOL_FALLBACK under test."""
 
