@@ -555,6 +555,19 @@ static inline int64_t fp8_nblk(int n){ return ((int64_t)n + FP8_BLOCK - 1) / FP8
  * is the GPU one; a vectorized CPU kernel is future work if measured needed).
  * Mirrors matmul_i3's double-accumulate-across-groups / float-within-group
  * convention so cross-block cancellation doesn't cost precision unfairly. */
+/* Constrain FP fusion for this kernel only.  The four-accumulator form is
+   algebraically identical to the one-accumulator loop, but under the project's
+   default -O3 -march=native GCC contracts the multiply-adds differently in the
+   four-chain shape, drifting results by ~1 ulp.  That breaks the byte-exact
+   contract tests/test_qwen38_native_weights.c pins against its independent
+   reference, and a one-ulp logit can flip an argmax in the token-exact gates.
+   Scoped with push/pop so no other kernel in this header is affected.
+   clang is deliberately NOT constrained: there the reference and this kernel
+   already contract identically, and forcing it off makes them disagree. */
+#if defined(__GNUC__) && !defined(__clang__)
+#  pragma GCC push_options
+#  pragma GCC optimize ("fp-contract=off")
+#endif
 static void matmul_fp8(float *y, const float *x, const uint8_t *q8, const float *bscale,
                        int S, int I, int O){
     int64_t nblkI = fp8_nblk(I);
@@ -599,6 +612,9 @@ static void matmul_fp8(float *y, const float *x, const uint8_t *q8, const float 
         }
     }
 }
+#if defined(__GNUC__) && !defined(__clang__)
+#  pragma GCC pop_options
+#endif
 
 /* ---- IDOT: integer dot kernels (int8-quantized activations) --------------- */
 #if defined(__AVX512VNNI__) && defined(__AVX512BW__)
