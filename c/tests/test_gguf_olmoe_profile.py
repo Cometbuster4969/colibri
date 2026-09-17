@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
 """tools/gguf_olmoe_profile.py: OLMoE name mapping, layout and int8 quantization.
 
-The strongest check here is test_matches_reference_quantizer: our numpy
-quantize_row is compared against the torch implementation in
-tools/convert_olmoe_merged.py, which is the code the existing OLMoE container
-was built with. If the two disagree, the new GGUF converter would produce a
-container the engine reads differently from the known-good one.
+The strongest check here is the quantizer comparison against
+tools/convert_olmoe_merged.py, the torch code the existing OLMoE container was
+built with. It runs in two forms: test_matches_reference_quantizer_golden uses
+the committed fixture (tests/fixtures/olmoe_quantize_row_golden.npz), generated
+once with that torch reference, so CI needs only numpy; the live variant
+test_matches_reference_quantizer_live re-runs the torch reference when it is
+installed. If the two disagree, the new GGUF converter would produce a container
+the engine reads differently from the known-good one.
 """
 
 import sys
@@ -20,6 +23,9 @@ except ImportError as exc:
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "tools"))
 
 import gguf_olmoe_profile as profile
+
+GOLDEN_QUANT = (Path(__file__).resolve().parent / "fixtures"
+                / "olmoe_quantize_row_golden.npz")
 
 
 class MappingTest(unittest.TestCase):
@@ -106,18 +112,41 @@ class QuantizationTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             profile.quantize_row(np.zeros(8, dtype=np.float32))
 
-    def test_matches_reference_quantizer(self):
+    def test_matches_reference_quantizer_golden(self):
+        """quantize_row pinned to the torch reference via a committed fixture.
+
+        The .npz holds the deterministic inputs plus convert_olmoe_merged.py's
+        int8 weights and scales (seed 20260825, 20 variable-shape cases), so CI
+        runs this check with only numpy installed.
+        """
+        if not GOLDEN_QUANT.is_file():
+            self.skipTest("golden fixture missing: %s" % GOLDEN_QUANT)
+        golden = np.load(str(GOLDEN_QUANT))
+        for i in range(int(golden["count"])):
+            w = golden["case_%02d_w" % i]
+            q_got, s_got = profile.quantize_row(w)
+            np.testing.assert_array_equal(
+                q_got, golden["case_%02d_q" % i], err_msg="case %d int8" % i)
+            np.testing.assert_allclose(
+                s_got, golden["case_%02d_s" % i], rtol=0, atol=0,
+                err_msg="case %d scales" % i)
+
+    def test_matches_reference_quantizer_live(self):
         try:
             import torch
             import convert_olmoe_merged as reference
         except ImportError as exc:
             self.skipTest("torch/convert_olmoe_merged unavailable: %s" % exc)
 
+        golden = np.load(str(GOLDEN_QUANT)) if GOLDEN_QUANT.is_file() else None
         rng = np.random.default_rng(20260825)
-        for _ in range(20):
+        for case in range(20):
             rows = int(rng.integers(1, 8))
             cols = int(rng.integers(1, 40))
             w = rng.normal(0.0, 1.0, size=(rows, cols)).astype(np.float32)
+            if golden is not None:
+                # the committed fixture and the live reference must agree
+                np.testing.assert_array_equal(w, golden["case_%02d_w" % case])
             q_ref, s_ref = reference.quantize_row(torch.from_numpy(w))
             q_got, s_got = profile.quantize_row(w)
             np.testing.assert_array_equal(q_got, q_ref.cpu().numpy())

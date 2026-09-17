@@ -90,14 +90,21 @@ def to_logical(flat, gguf_dims):
 def restore_rope_layout(weights, n_head, n_kv_head=None):
     """Undo llama.cpp's RoPE permutation of q_proj/k_proj weights.
 
-    conversion/olmo.py permutes q_proj and k_proj exactly like Llama:
+    Only llama.cpp's *dense* OLMo converter does this: conversion/olmo.py's
+    OlmoModel (OlmoForCausalLM) permutes q_proj and k_proj exactly like Llama:
         forward: w.reshape(n, 2, out // n // 2, *rest).swapaxes(1, 2).reshape(w.shape)
     with n = n_kv_head when it differs from n_head (k_proj), else n_head. That
     is NOT an involution unless out // n // 2 == 2, so the inverse is the axis
     transpose of the (m, 2) decomposition:
         inverse: w.reshape(n, m, 2, *rest).swapaxes(1, 2).reshape(w.shape)
-    with m = out // n // 2. c/olmoe.c uses HF-style RoPE (adjacent pairs per
-    head), so the GGUF's permuted q/k must be restored to the HF layout.
+    with m = out // n // 2.
+
+    The OLMoE converter is a different class, OlmoeModel (OlmoeForCausalLM), and
+    does NOT permute: llama.cpp runs LLM_ARCH_OLMOE with NEOX RoPE -- pairs of
+    head values offset by head_dim/2 -- the same layout as HuggingFace's
+    rotate_half and c/olmoe.c's rope_head. The official OLMoE GGUF is therefore
+    already in the HF layout; this function is only for a GGUF that a permuting
+    converter produced.
     """
     n = n_kv_head if (n_kv_head and n_head != n_kv_head) else n_head
     w = np.asarray(weights)

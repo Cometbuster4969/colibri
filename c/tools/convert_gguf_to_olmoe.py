@@ -12,9 +12,9 @@ Output, per tensor, matches what c/olmoe.c loads:
     model.layers.N.mlp.experts.E.merged_weight (I8) + .qs (F32);
   * config.json reconstructed from the GGUF olmoe.* metadata. GGUF does not
     carry norm_topk_prob; the default is false (matching the official OLMoE
-    checkpoints) and --norm-topk-prob overrides it. q/k are taken as stored
-    (HuggingFace layout); --qk-permuted undoes llama.cpp's RoPE permutation for
-    GGUFs that carry it;
+    checkpoints) and --norm-topk-prob overrides it. q/k are taken as stored:
+    the official OLMoE GGUF is already in the HuggingFace layout. --qk-permuted
+    undoes llama.cpp's RoPE permutation for a GGUF that carries it;
   * tokenizer.json rebuilt from tokenizer.ggml.* (byte-level GPT-2), validated
     token-for-token against the official OLMoE tokenizer, so the container is
     usable for chat/serve, not only loadable for validation.
@@ -170,8 +170,9 @@ def convert_dense(reader, dense, writer, config, qk_permuted):
         flat = dequantize(raw, tensor["ggml_type"], tensor["numel"])
         logical = profile.to_logical(flat, tensor["dims"])
         if qk_permuted:
-            # Some GGUF producers (recent llama.cpp olmo.py) RoPE-permute q/k;
-            # c/olmoe.c uses the plain HuggingFace layout, so undo it.
+            # llama.cpp's dense OLMo converter (OlmoModel, not OlmoeModel)
+            # RoPE-permutes q/k; c/olmoe.c uses the plain HuggingFace layout, so
+            # undo it. The official OLMoE GGUF is not permuted.
             name = tensor["name"]
             if name.endswith("attn_q.weight"):
                 logical = profile.restore_rope_layout(logical, config["num_attention_heads"],
@@ -193,10 +194,7 @@ def convert_experts(reader, experts, writer, config):
     done_experts = 0
 
     for layer in range(layer_count):
-        kinds = experts.get(layer)
-        if not kinds or set(kinds) != {"gate", "up", "down"}:
-            raise ConversionError("layer %d: incomplete expert trio: %s"
-                                  % (layer, sorted(kinds) if kinds else None))
+        kinds = experts[layer]
         raw_bytes, expert_layout = {}, {}
         for kind in ("gate", "up", "down"):
             tensor = kinds[kind]
@@ -270,6 +268,11 @@ def run(args):
         missing = sorted(required_names(config) - present)
         if missing:
             raise ConversionError("missing required tensors: %s" % ", ".join(missing[:8]))
+        for layer in range(config["num_hidden_layers"]):
+            kinds = experts.get(layer)
+            if not kinds or set(kinds) != {"gate", "up", "down"}:
+                raise ConversionError("layer %d: incomplete expert trio: %s"
+                                      % (layer, sorted(kinds) if kinds else None))
 
         experts_total = config["num_hidden_layers"] * config["num_experts"]
         if args.dry_run:
@@ -371,9 +374,9 @@ def main():
                              "weights). GGUF does not carry this field; the default is false, "
                              "which matches the official OLMoE checkpoints")
     parser.add_argument("--qk-permuted", action="store_true",
-                        help="undo llama.cpp's RoPE permutation of q_proj/k_proj. Off by "
-                             "default because the official OLMoE GGUF is already in the "
-                             "HuggingFace layout; use it only for GGUFs that were permuted")
+                        help="undo llama.cpp's dense-OLMo RoPE permutation of q_proj/k_proj. "
+                             "Off by default because the official OLMoE GGUF is already in "
+                             "the HuggingFace layout; use it only for GGUFs that were permuted")
     parser.add_argument("--flush-every", type=int, default=512, metavar="N",
                         help="flush an output safetensors shard every N tensors "
                              "(default: 512; smaller = more, smaller shards)")
