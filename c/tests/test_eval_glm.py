@@ -26,8 +26,7 @@ that performs them:
   is exactly the defect dev's plain ``line[0] in "-0123456789"`` filter
   does not catch (differential bite, below).
 - `score_request_wire`: strict ASCII/LF request grammar, the per-record
-  SHA-256 digest, and the inclusive 256 MiB engine text limit shared with
-  `check_ablate_evidence.py`.
+  SHA-256 digest, and the inclusive 256 MiB engine text limit.
 - `completion_error`: the exact zero-exit/complete-count/positive-token
   denominator that alone passes.
 - `main`: incremental durability (one written+flushed row per completed
@@ -42,9 +41,6 @@ Deferred (need a live binary this module does not have access to):
 - `test_c_emitted_c17g_corpus_is_canonical`, which drives
   ``test_logprob_wire --score-c17g-fixture`` (a binary produced by a
   different part of this project's build, not present here).
-- the ABLATE-block stdout probes (`c_manifest_accepts`/
-  `test_complete_production_fixture_is_strict_json`-style checks): out of
-  scope for this module (owned by `test_check_ablate_evidence.py`).
 
 No model is run by the committed tests -- every case here drives
 `eval_glm.py` against an injected stand-in for the direct engine launch
@@ -75,18 +71,11 @@ _spec = importlib.util.spec_from_file_location(
 EVAL = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(EVAL)
 
-_ablate_spec = importlib.util.spec_from_file_location(
-    "check_ablate_evidence_under_test", TOOLS / "check_ablate_evidence.py")
-ABLATE = importlib.util.module_from_spec(_ablate_spec)
-_ablate_spec.loader.exec_module(ABLATE)
-
 
 class EvalGlmEvidenceTests(unittest.TestCase):
     BANNER = (
         "== GLM C engine (glm_moe_dsa), cache=64 experts/layer | "
         "compute experts@4-bit dense@8-bit | idot: neon-i8mm ==")
-    CONFIG = (b'{"vocab_size":4,"num_hidden_layers":4,'
-              b'"first_k_dense_replace":1,"n_routed_experts":5}\n')
 
     @staticmethod
     def loaded(state="ACTIVE", draft=1, layers=78, experts=256,
@@ -759,39 +748,16 @@ class EvalGlmEvidenceTests(unittest.TestCase):
         self.assertIn("MEAN acc_norm", self.last_stdout)
 
     def test_python_engine_byte_limits_are_inclusive_and_preallocation(self):
-        # The 256 MiB inclusive engine-text limit is shared between
-        # this module and check_ablate_evidence.py; checked on both
-        # sides of the shared constant/helper.
         engine_limit = 256 << 20
-        self.assertEqual(ABLATE._ENGINE_TEXT_MAX_BYTES, engine_limit)
         self.assertEqual(EVAL._ENGINE_TEXT_MAX_BYTES, engine_limit)
-        self.assertEqual(
-            ABLATE._checked_engine_text_size(engine_limit, "config"),
-            engine_limit)
         self.assertEqual(
             EVAL._checked_engine_text_size(engine_limit, "SCORE"),
             engine_limit)
-        with self.assertRaises(ABLATE.AblateEvidenceError):
-            ABLATE._checked_engine_text_size(engine_limit + 1, "config")
         with self.assertRaises(EVAL.EvidenceError):
             EVAL._checked_engine_text_size(engine_limit + 1, "SCORE")
 
         with tempfile.TemporaryDirectory() as tmp:
             root = pathlib.Path(tmp)
-            ablate_config = root / "ablate-config.json"
-            ablate_config.write_bytes(self.CONFIG)
-            with mock.patch.object(
-                    ABLATE, "_ENGINE_TEXT_MAX_BYTES", len(self.CONFIG)):
-                identity = ABLATE._config_identity(ablate_config)
-                self.assertEqual(identity["vocab"], 4)
-                self.assertEqual(
-                    identity["config_sha256"],
-                    hashlib.sha256(self.CONFIG).hexdigest())
-                ablate_config.write_bytes(self.CONFIG + b" ")
-                with self.assertRaisesRegex(
-                        ABLATE.AblateEvidenceError, "256 MiB"):
-                    ABLATE._config_identity(ablate_config)
-
             score_config = root / "config.json"
             score_raw = b'{"vocab_size":4}\n'
             score_config.write_bytes(score_raw)
