@@ -332,6 +332,7 @@ and costs the contention. Anything that tries again has to start from that.
 
 | variable | default | what it does |
 |---|---|---|
+| `COLI_KV_PREFIX` | **off on this engine** | `1` reuses the previous turn's state when the new prompt begins with what that state was built from, instead of re-reading the transcript. Off by default here and on nowhere else: see "Reusing a turn" below for what it costs. |
 | `V41_STATS` | off | per-turn accounting on stderr: the n-gram cache, the expert bytes and their rate, and how many drafts were accepted. Off by default because `coli chat` shows the engine's stderr next to the answer. |
 | `V41_READ_DEPTH` | 8 | expert tensors read at once when a step misses the cache (see above). `1` restores the serial read the engine used to do, for an A/B. |
 | `COLI_MODEL_MIRROR` | unset | `;`/`,`-separated read-only copies of the checkpoint on other drives; expert reads split across the primary and every replica (see above). `SNAP_MIRROR` is the legacy alias. |
@@ -346,6 +347,50 @@ and costs the contention. Anything that tries again has to start from that.
 | `V41_DSPARK_MAX` | the checkpoint's `dspark_block_size` | how many of the drafted tokens are put in front of the main model. Fewer means a cheaper rejected round and a lower ceiling on the win. |
 | `V41_DSPARK_MINACC` | 60 | percent of drafts that must be accepted over a window of ten for drafting to continue; below it, drafts pause for 64 tokens. 60 is the measured break-even, not a guess. |
 | `V41_SPEC_FORCE` | unset | oracle mode only: draft the reference's tokens (`1`), corrupt the last one (`2`), or use the head's own (`3`), to exercise the verification path on a fixture whose draft head is random. |
+
+## Reusing a turn, and why it is asked for rather than assumed
+
+A chat client resends the whole conversation every turn. Every other engine in
+the tree skips the part it already holds, because for them a reused prefix is
+the same computation as a cold prefill: the reuse changes the time and nothing
+else. Here it is not, and the reason belongs to the model rather than to us.
+
+A query reads one set of index keys when its position is **prefilled** -- its
+layer's own index owner, masked to what the query can reach -- and another when
+the position is **decoded**, namely whatever was published last. Both are the
+vendor's, and neither can be moved to match the other:
+
+| | tiny oracle |
+|---|---|
+| as shipped | 8/8 |
+| the prefill given the decode schedule | 7/8 |
+| the decode given the prefill owner | 1/8 |
+
+So a position generated in an earlier turn does not attend the way the same text
+attends when it is prefilled cold. A resumed conversation and the same
+conversation re-read from scratch can answer differently. The resumed state is
+the sequential one, so it is not the wrong answer -- it is a different one, and
+that is a trade the person running the engine makes, not one the engine makes
+for them. `COLI_KV_PREFIX=1` asks for it.
+
+What is exact, and gated in CI, is a resumed **prefill**: a prompt that grows
+without generated text in between -- an agent resending a document, a tool loop
+-- reuses losslessly. Measured on the tiny fixture, a prefill that resumes 4,
+12, 24 or 48 tokens from the end reproduces the cold prefill's tokens exactly.
+That was not free: the index-key schedule used to be selected by `start_pos > 0`,
+which meant "the speculative verify batch" only because a prefill always started
+at position 0. A resumed prefill matched it too and took the decode schedule,
+reading another layer's keys and choosing a different index top-k. It is now
+selected by the flag that actually distinguishes the two.
+
+Three more things the attempt turned up, all of them unreachable before reuse
+existed and all fixed here: the per-layer undo buffers (`ring_save`,
+`cstate_save_*`) are sized for one draft block and were written on any multi-row
+forward past position 0, which a resumed prefill overflows; `spec_step` decided
+"seed the stages, do not draft" by `start_pos == 0` and seeded them at position
+0, so a resumed prefill fell into the drafting path with no draft buffer; and the
+record follows the speculative rollback, so it never claims rows the caches gave
+back.
 
 ## How it is tested
 

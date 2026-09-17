@@ -63,6 +63,7 @@
 #include "quant.h"
 #include "sparse_attn.h"
 #include "omp_tune.h"
+#include "kv_prefix.h"   /* riuso del prefisso tra turni (shared) */
 #include <pthread.h>   /* ehit_mark publishes the lazy HITS table under a lock */
 #if defined(__AVX2__)
 #include <immintrin.h>
@@ -846,6 +847,24 @@ typedef struct {
      * speculative step keeps only the prefix that verified, and the next draft has to
      * seed the stages with exactly the positions that were committed */
     int last_start, last_rows;
+    /* Whether THIS forward's rows may be rolled back, i.e. whether it is the
+     * speculative verify batch. The per-layer undo buffers (ring_save,
+     * cstate_save_*) are sized for one draft block and nothing else, because
+     * until prefix reuse existed a forward with many rows always started at
+     * position 0 and took the batched paths that write no undo at all. A
+     * prefill that resumes mid-sequence is many rows AND past position 0, so
+     * the guard cannot be `n > 1` any more: it has to be the reason the buffers
+     * exist. A prefill is never rolled back. */
+    int rollback_save;
+    /* What the state describes, so a turn that resends the transcript feeds only
+     * the new tail. Everything a turn builds here is position-indexed and
+     * append-only -- the window rings and their position map, the compressor's
+     * group slots and its partial group, the index keys, the engram history --
+     * so a state that stopped at position P IS the state at P. The one thing
+     * that is not described by a token id is an image: its placeholders carry
+     * the same id whatever the picture was, so consuming one taints the record
+     * (see kv_prefix.h). */
+    kv_prefix kvp;
 } Model;
 
 /* ------------------------------------------------------------ rope --------- */
@@ -1189,6 +1208,28 @@ static int expert_read_depth(void) {
  * once out of it -- to leave the cache exactly as cold as it was. V41_DIRECT=0
  * restores the buffered path, which is the arm of the A/B and the escape hatch
  * on a device where the direct path turns out to be slower. */
+/* COLI_KV_PREFIX: on this engine reuse is OPT-IN, which it is on no other.
+ *
+ * Everywhere else a reused prefix is the same computation as a cold prefill, so
+ * reuse changes the time and nothing else and can be on by default. Here it is
+ * not, and the reason is the vendor's, not ours: a query reads one set of index
+ * keys when its position is prefilled (its layer's own index owner, masked to
+ * the query's reach) and another when the position is decoded (whatever was
+ * published last). Both are load-bearing -- giving the prefill the decode
+ * schedule drops the tiny oracle to 7/8, giving the decode the prefill owner
+ * drops it to 1/8 -- so a position that was generated in an earlier turn does
+ * not attend the way the same text attends when prefilled cold.
+ *
+ * What that costs: a conversation resumed from its own state and the same
+ * conversation re-read from scratch can answer differently. The resumed state is
+ * the sequential one, so it is not the wrong answer; it is a different one, and
+ * on a 510 GB model it arrives in seconds instead of minutes. That is a trade
+ * the person running the engine should make, so it is asked for rather than
+ * assumed. A resumed PREFILL is exact (docs/deepseek-v41.md records the split
+ * measurements), so a prompt that only ever grows without generated text in
+ * between -- an agent resending a document, a tool loop -- reuses losslessly. */
+static int kv_prefix_on(void){ const char *e = getenv("COLI_KV_PREFIX"); return e && *e != '0'; }
+
 static int expert_direct(void) {
     static int on = -1;
     if (on < 0) on = getenv("V41_DIRECT") ? atoi(getenv("V41_DIRECT")) : 1;
@@ -1410,6 +1451,10 @@ static void model_load(Model *m, const char *snap, int ecap, int engram_cache_ro
     Cfg *c = &m->c;
     cfg_load(c, snap);
     attn_project_check(c);
+    /* Sized with the state it describes. CTX caps max_positions (#1526), so this
+     * is one int per position the engine can actually hold, not per position the
+     * checkpoint allows. A failure here disables reuse and nothing else. */
+    kv_prefix_alloc(&m->kvp, c->max_positions);
     /* COLI_MODEL_DIRS: the container split across drives as DISTINCT shards, so
      * the 510 GB this engine streams can live on two drives of ~256 GB instead
      * of one of 512 -- which is the configuration most people can actually
@@ -1655,7 +1700,7 @@ static int compressor_run(Model *m, int layer, const float *x, int n, int start_
         for (int t = 0; t < n; t++) {
             int pos = start_pos + t;
             int slot = pos % ratio;
-            if (n > 1) {
+            if (n > 1 && m->rollback_save) {
                 memcpy(l->cstate_save_kv + (size_t)t * hd, l->cstate_kv + (size_t)slot * hd,
                        (size_t)hd * sizeof(float));
                 memcpy(l->cstate_save_score + (size_t)t * hd, l->cstate_score + (size_t)slot * hd,
@@ -1763,7 +1808,13 @@ static void indexer_run(Model *m, int layer, const float *x, const float *qr, in
             int published = published_owner(m, layer, start_pos, t);
             if (published >= 0) ikey = m->L[published].ikey;
             else if (m->pub_rows > 0) { if (m->pub_before) ikey = m->pub_before; }
-            else if (m->published_index_k) ikey = m->published_index_k;
+            /* One position reads whatever was published last; a prefill reads its
+             * own index owner, whose keys already cover the whole chunk and are
+             * masked to each query's reach by `lens` above. A resumed prefill
+             * inherits a published pointer from the previous turn, and honouring
+             * it here would make the same position read different keys than it
+             * read when prefilled cold. */
+            else if (n == 1 && m->published_index_k) ikey = m->published_index_k;
         }
         mv8(q, &l->idx_wq_b, qr + (size_t)t * c->q_lora);
         for (int h = 0; h < nh; h++)
@@ -2025,7 +2076,7 @@ static void attention_run(Model *m, int layer, const float *x, int n, int start_
     for (int t = 0; t < n; t++) {
         if (start_pos > 0) {
             int pos = start_pos + t, slot = pos % c->window;
-            if (n > 1) {
+            if (n > 1 && m->rollback_save) {
                 memcpy(l->ring_save + (size_t)t * hd, l->window + (size_t)slot * hd,
                        (size_t)hd * sizeof(float));
                 l->ring_save_pos[t] = l->window_pos[slot];
@@ -2791,12 +2842,25 @@ static int spec_step(Model *m, int token, int start_pos, int main_rows,
         mv8(scratch, &sp->main_proj, m->main_hidden + (size_t)t * targets * dim);
         rms_into(main_x + (size_t)t * dim, scratch, sp->main_norm.w, dim, c->norm_eps);
     }
-    if (start_pos == 0) {
+    /* Seed only, no drafting: that is what a NULL draft buffer asks for. Until
+     * prefix reuse existed this was spelled `start_pos == 0`, because the only
+     * forward that ever started at position 0 was the prompt's. A prefill that
+     * resumes mid-sequence is the same call at a different position, and it has
+     * to seed the stages at THAT position -- writing the tail's keys into slots
+     * 0..rows-1 would leave the stages describing a sequence nobody fed. */
+    if (!draft) {
         for (int stage = 0; stage < c->n_mtp; stage++)
-            spec_attention(m, stage, NULL, 0, 0, main_x, main_rows, NULL);
+            spec_attention(m, stage, NULL, 0, start_pos, main_x, main_rows, NULL);
         free(main_x); free(scratch);
         return 0;
     }
+    /* A cold run still declines to draft on the first decode step, where
+     * start_pos is still the prefill's 0 and the stages were seeded a moment
+     * ago. Kept separate from the guard above so this change does not move when
+     * a cold conversation starts drafting; a resumed one starts immediately,
+     * which costs a draft round's reads and can only change the acceptance
+     * rate, never a token -- every draft is verified before it is emitted. */
+    if (start_pos == 0) { free(main_x); free(scratch); return 0; }
 
     float *h = xmalloc((size_t)block * hc * dim * sizeof(float), "spec streams");
     for (int i = 0; i < block; i++) {
@@ -2943,7 +3007,20 @@ static void forward_full(Model *m, const int *ids, int n, float *logits, int all
     m->pub_before = m->published_index_k;
     m->pub_before_layer = m->published_index_layer;
     m->pub_rows = 0;
-    if (n > 1 && start_pos > 0) {
+    /* Only the speculative verify batch is ever rolled back (spec_verify is its
+     * only caller), and only it may write the per-layer undo buffers. */
+    m->rollback_save = all_logits;
+    /* Several positions at once is either the speculative verify batch, which
+     * needs this per-row schedule because its rows are consecutive decode steps,
+     * or a prefill, which reads its index owner's keys for the whole chunk. The
+     * condition used to be `start_pos > 0`, which picked out the speculative
+     * case only because a prefill always started at position 0. A prefill that
+     * resumes mid-sequence is many rows past position 0 and is still a prefill:
+     * given the decode schedule it reads a different layer's keys than the same
+     * positions read when they were prefilled cold, and picks a different
+     * index top-k. `all_logits` is what actually distinguishes the two --
+     * spec_verify is its only caller. */
+    if (n > 1 && all_logits) {
         m->pub_layer = realloc(m->pub_layer, (size_t)n * sizeof(int));
         if (!m->pub_layer) { fprintf(stderr, "OOM sizing the publish schedule\n"); exit(1); }
         m->pub_rows = n;
@@ -3106,6 +3183,11 @@ static void forward_full(Model *m, const int *ids, int n, float *logits, int all
     trace("logits", -1, logits + (size_t)(all_logits ? n - 1 : 0) * c->vocab, c->vocab);
 
     m->pos += n;
+    /* Recorded where the tokens entered the state, and only for the MAIN stream:
+     * the draft stages read this window and never write it, so a speculative
+     * round adds nothing here until spec_verify commits through forward_batch. */
+    if (image_rows || image_mask) kv_prefix_taint(&m->kvp);
+    kv_prefix_record(&m->kvp, ids, start_pos, n);
     m->last_start = start_pos;
     m->last_rows = n;
     m->forwards++;
@@ -3146,6 +3228,10 @@ static void model_reset(Model *m) {
     m->published_index_k = NULL;
     m->shared_topk_rows = m->shared_topk_width = 0;
     m->pos = 0;
+    /* Paired with the reset on purpose: whoever drops the state must also forget
+     * what it was built from, or the two disagree in favour of the one nobody
+     * can check. */
+    kv_prefix_clear(&m->kvp);
 }
 
 static const ColiServeWireProfile v41_wire = {
@@ -3242,6 +3328,11 @@ static void spec_rollback(Model *m, int start_pos, int committed, int rows) {
     m->pos = start_pos + committed;
     m->last_rows = committed;
     if (m->engram.active && m->engram.history_len > m->pos) m->engram.history_len = m->pos;
+    /* The record follows the rollback for the same reason the engram history
+     * does: the rejected rows are no longer in the state, and a record that
+     * still claimed them would hand the next turn positions nothing holds. The
+     * ids below m->pos are the committed ones, so truncating is enough. */
+    if (m->kvp.len > m->pos) m->kvp.len = m->pos;
     if (m->pub_rows > 0) {
         const float *published = m->pub_before;
         int layer = m->pub_before_layer;
@@ -3464,9 +3555,32 @@ static void serve_loop(Model *m, Tok *tokenizer, const char *snap) {
             mir_bytes0[r] = g_mir_bytes[r];
             mir_reads0[r] = g_mir_nread[r];
         }
-        model_reset(m);
         int n_prompt = tok_encode(tokenizer, (const char *)command.payload,
                                   (int)command.payload_bytes, ids, c->max_positions);
+        /* Decided BEFORE the reset, because the reset is what it decides about.
+         * A chat client resends the whole transcript every turn; if this prompt
+         * begins with the ids the state was built from, that state already IS
+         * the state at those positions, so only the tail is fed. Reuse is all or
+         * nothing -- nothing here can rewind four caches and a ring. An image
+         * refuses it outright: the placeholder ids describe the span but not the
+         * picture, and the span's offsets are computed against the whole prompt.
+         * COLI_KV_PREFIX=0 disables it, COLI_PREFIX_LOG=1 reports the decision. */
+        int reuse = 0;
+        if (n_prompt >= 1 && kv_prefix_on() && !pending_image)
+            reuse = kv_prefix_reuse(&m->kvp, ids, n_prompt);
+        if (getenv("COLI_PREFIX_LOG")) {
+            if (reuse)
+                fprintf(stderr, "[PREFIX] reusing %d of %d prompt tokens (%.0f%%)\n",
+                        reuse, n_prompt, 100.0 * reuse / n_prompt);
+            else
+                fprintf(stderr, "[PREFIX] no reuse: held=%d cap=%d prompt=%d%s%s%s\n",
+                        m->kvp.len, m->kvp.cap, n_prompt,
+                        m->kvp.tainted ? " tainted" : "",
+                        pending_image ? " (image)" : "",
+                        kv_prefix_on() ? "" : " (off: set COLI_KV_PREFIX=1)");
+            fflush(stderr);
+        }
+        if (!reuse) model_reset(m);
         if (n_prompt < 1) {
             coli_serve_write_error(stdout, command.id, "EMPTY_PROMPT");
             coli_serve_command_dispose(&command); continue;
@@ -3510,7 +3624,10 @@ static void serve_loop(Model *m, Tok *tokenizer, const char *snap) {
             }
         }
         free(pending_image); pending_image = NULL;
-        forward_with_image(m, ids, n_prompt, logits, aligned, image_at, image_h, image_w, image_mask);
+        /* `reuse` is the ABSOLUTE position of the first fresh token: every cache
+         * here is position-indexed, so this has to be the real offset. */
+        forward_with_image(m, ids + reuse, n_prompt - reuse, logits, aligned,
+                           image_at, image_h, image_w, image_mask);
         free(aligned); free(image_mask);
         uint64_t prefill_bytes = m->expert_bytes - ebytes0;
         double prefill_disk = m->t_disk - disk0;

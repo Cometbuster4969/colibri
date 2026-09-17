@@ -69,7 +69,7 @@ except ModuleNotFoundError:
         _version = "unknown"
 
 from family_registry import (FamilyConfigError, UnknownFamilyError, all_families,
-                             family_by_id, family_for_config, resolve_model,
+                             display_for, family_by_id, family_for_config, resolve_model,
                              tuning_replay_prompt)
 
 _TUNE_ROTATION_PROMPT = (
@@ -190,9 +190,16 @@ def model_banner_line(model):
     except (OSError, ValueError, TypeError):
         return generic
     kind = (cfg.get("model_type") or "").lower()
+    geometry = cfg
     try:
-        family = resolve_model(model).descriptor
-        name, scale = family.display_name, family.display_scale
+        resolved = resolve_model(model)
+        family = resolved.descriptor
+        # Size-aware: a family's model_type can span checkpoints an order of
+        # magnitude apart (Qwen3.6-35B and Qwen3.8-2.4T both resolve to
+        # qwen36). display_for names the geometry actually on disk, and
+        # falls back to the model_type when it recognises none.
+        name, scale = display_for(resolved)
+        geometry = resolved.family_config
         # display_scale e' la taglia del checkpoint di riferimento. Un REAP ha
         # lo stesso model_type e meno esperti: "284B" su un 150B e' #1367
         # di nuovo. Quando la geometria non e' quella del riferimento si
@@ -206,10 +213,11 @@ def model_banner_line(model):
         scale = ""
 
     bits = [name]
+    experts = geometry.get("n_routed_experts") or geometry.get("num_experts")
     if scale:
-        bits.append(f"{scale} MoE" if cfg.get("n_routed_experts") else scale)
+        bits.append(f"{scale} MoE" if experts else scale)
     else:
-        layers, experts = cfg.get("num_hidden_layers"), cfg.get("n_routed_experts")
+        layers = geometry.get("num_hidden_layers")
         if layers and experts:
             bits.append(f"{layers}L x {experts}E MoE")
         elif layers:
@@ -607,8 +615,11 @@ def dsv4_cuda_available(model=None):
     # not make a CPU engine look GPU-capable.
     eng = engine_for(model) if model else GLM
     if sys.platform == "win32":
-        dll = os.path.join(os.path.dirname(eng), "coli_cuda_dsv4.dll")
-        return os.path.exists(dll)
+        # backend_loader_dsv4.c tries the DeepGEMM build first and the generic
+        # one second, so either next to the engine starts the tier (the same
+        # two names `coli doctor` accepts).
+        return any(os.path.exists(os.path.join(os.path.dirname(eng), name))
+                   for name in ("coli_cuda_dsv4_dg.dll", "coli_cuda_dsv4.dll"))
     if sys.platform == "linux" and os.path.exists(eng):
         try:
             linked = subprocess.run(["ldd", eng], capture_output=True, text=True, timeout=3)
@@ -1332,9 +1343,13 @@ def cmd_run(a):
         # emits the answer and exits cleanly. No reason to spin up the gateway
         # for a single non-interactive prompt.
         e=env_for_engine(a,arch)
+        # The engine tokenizes the bytes it reads as UTF-8. A text-mode pipe
+        # would encode the prompt in the locale's code page instead: a
+        # UnicodeEncodeError on cp949/cp932 or the C locale, garbled bytes on
+        # cp1252. Hand it the bytes, like the V4 path's UTF-8 prompt file.
         result=subprocess.run(
             [engine, str(cap_for_launch(a.cap,e,16)), "8"],
-            input=prompt+"\n", text=True, env=e, check=False)
+            input=(prompt+"\n").encode("utf-8"), env=e, check=False)
         sys.exit(result.returncode)
     # template ufficiale GLM-5.2: niente \n dopo i ruoli; <think></think> = risposta diretta (nothink).
     # THINK=1 lascia <think> aperto, stessa convenzione del serve mode (glm.c). EN: THINK=1 leaves
