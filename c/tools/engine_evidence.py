@@ -1,8 +1,4 @@
-"""Helpers for reading what the engine wrote, and for reproducing what it read.
-
-Two unrelated jobs live here because both are shared by more than one
-checker: parsing the engine's startup preamble lines, and reproducing the
-canonical form of a manifest that the engine binds by digest.
+"""Helpers for reading what the engine wrote at startup.
 
 Recognizes the two typed lines the engine prints at startup -- the
 "== GLM C engine ..." banner and the following "loaded in ..." record --
@@ -10,13 +6,6 @@ and returns their fields as typed values, used by the evidence checkers
 that read raw engine stdout. A line that merely looks like one of these
 preambles but fails a field check is a bug worth surfacing loudly, so
 parsing raises rather than silently skipping.
-
-canonical_manifest_bytes() is the other half: the engine accepts a manifest
-saved with either line ending and with or without a final newline, and
-digests the normalised form rather than the file as it sits on disk. A
-checker that hashed the raw file would disagree with the engine about a
-manifest both of them accept, so the rule lives here once and both sides
-use it.
 """
 
 import math
@@ -113,46 +102,3 @@ def parse_engine_preamble(line):
     if line.startswith("loaded in"):
         return parse_engine_loaded(line)
     return None
-
-
-class ManifestFormError(ValueError):
-    """A manifest cannot be reduced to the canonical form the engine binds."""
-
-
-def canonical_manifest_bytes(raw):
-    """Return the exact byte stream the engine digests for this manifest.
-
-    The engine reads the file a line at a time, drops the line terminator,
-    drops one carriage return in front of it if there is one, and digests the
-    remaining record followed by a single newline. A file saved with CRLF
-    endings, or without a terminator on its last line, therefore produces the
-    same digest as the same content saved as plain newline-terminated text --
-    which is what a host editor makes it easy to get wrong.
-
-    Everything else is still refused, and refused here rather than later:
-    an empty file, an empty record, a carriage return inside a record, and an
-    embedded NUL. Those are not framings of valid content, they are corruption.
-    """
-    if not isinstance(raw, (bytes, bytearray)):
-        raise ManifestFormError(f"manifest is not bytes: {type(raw).__name__}")
-    raw = bytes(raw)
-    if not raw:
-        raise ManifestFormError("manifest is empty")
-    if b"\0" in raw:
-        raise ManifestFormError("manifest contains a NUL byte")
-    records = raw.split(b"\n")
-    if records and records[-1] == b"":
-        records.pop()          # the file ended with its terminator
-    if not records:
-        raise ManifestFormError("manifest holds no records")
-    canonical = []
-    for number, record in enumerate(records, 1):
-        if record.endswith(b"\r"):
-            record = record[:-1]
-        if not record:
-            raise ManifestFormError(f"manifest line {number} is empty")
-        if b"\r" in record:
-            raise ManifestFormError(
-                f"manifest line {number} has a carriage return inside it")
-        canonical.append(record)
-    return b"\n".join(canonical) + b"\n"
