@@ -555,19 +555,35 @@ static inline int64_t fp8_nblk(int n){ return ((int64_t)n + FP8_BLOCK - 1) / FP8
  * is the GPU one; a vectorized CPU kernel is future work if measured needed).
  * Mirrors matmul_i3's double-accumulate-across-groups / float-within-group
  * convention so cross-block cancellation doesn't cost precision unfairly. */
-/* Constrain FP fusion for this kernel only.  The four-accumulator form is
-   algebraically identical to the one-accumulator loop, but under the project's
-   default -O3 -march=native GCC contracts the multiply-adds differently in the
-   four-chain shape, drifting results by ~1 ulp.  That breaks the byte-exact
+/* Two kernels, selected by compiler, because the faster one is only
+   BIT-EXACT under clang.
+
+   The four-accumulator form is algebraically identical to the one-accumulator
+   loop - same operands, same column order - so any difference comes purely
+   from the compiler contracting multiply-adds differently in the four-chain
+   shape, which drifts results by ~1 ulp.  That would break the byte-exact
    contract tests/test_qwen38_native_weights.c pins against its independent
    reference, and a one-ulp logit can flip an argmax in the token-exact gates.
-   Scoped with push/pop so no other kernel in this header is affected.
-   clang is deliberately NOT constrained: there the reference and this kernel
-   already contract identically, and forcing it off makes them disagree. */
-#if defined(__GNUC__) && !defined(__clang__)
-#  pragma GCC push_options
-#  pragma GCC optimize ("fp-contract=off")
-#endif
+
+   Under GCC that contraction cannot be controlled from source.  Measured on
+   gcc 13.4, clean build per cell, against this kernel's own test:
+     - #pragma GCC optimize ("fp-contract=off")     ignored (no-op)
+     - #pragma GCC optimize ("-ffp-contract=off")   ignored (no-op)
+     - __attribute__((optimize("-ffp-contract=off"))) ignored (no-op)
+     - #pragma STDC FP_CONTRACT OFF                 unimplemented: GCC warns
+                                                    "ignoring '#pragma STDC
+                                                    FP_CONTRACT'"
+   Only the command-line -ffp-contract=off works, and that is a global numerics
+   decision this kernel has no business making for the whole project.  With no
+   guard, the four-row form is exact on -march=znver3 and -march=x86-64-v3 but
+   NOT on -march=haswell, so "it passed on my machine" is not evidence here.
+
+   clang contracts the reference and this kernel identically, so the four-row
+   form is bit-exact there: verified on arm64 (binary byte-identical to the
+   one-row build) and on x86 clang at -march=haswell, znver3 and x86-64-v3.
+   So clang gets the fast kernel and GCC keeps upstream's, which is exact on
+   every arch tested. */
+#if defined(__clang__)
 static void matmul_fp8(float *y, const float *x, const uint8_t *q8, const float *bscale,
                        int S, int I, int O){
     int64_t nblkI = fp8_nblk(I);
@@ -612,8 +628,30 @@ static void matmul_fp8(float *y, const float *x, const uint8_t *q8, const float 
         }
     }
 }
-#if defined(__GNUC__) && !defined(__clang__)
-#  pragma GCC pop_options
+#else
+/* GCC and everything else: upstream's one-row kernel, unchanged.  Exact on
+   every -march tested; see the note above for why it is not simply replaced. */
+static void matmul_fp8(float *y, const float *x, const uint8_t *q8, const float *bscale,
+                       int S, int I, int O){
+    int64_t nblkI = fp8_nblk(I);
+    #pragma omp parallel for schedule(static)
+    for(int o=0;o<O;o++){
+        const uint8_t *w = q8 + (int64_t)o*I;
+        int64_t blkO = o / FP8_BLOCK;
+        const float *scl = bscale + blkO*nblkI;
+        for(int s=0;s<S;s++){
+            const float *xs = x + (int64_t)s*I;
+            double a=0;
+            for(int64_t bi=0; bi*FP8_BLOCK<I; bi++){
+                int base=(int)(bi*FP8_BLOCK); int blen=FP8_BLOCK; if(base+blen>I) blen=I-base;
+                float sc=scl[bi]; float acc=0;
+                for(int i=base;i<base+blen;i++) acc += e4m3_decode(w[i])*xs[i];
+                a += (double)acc*sc;
+            }
+            y[(int64_t)s*O+o]=(float)a;
+        }
+    }
+}
 #endif
 
 /* ---- IDOT: integer dot kernels (int8-quantized activations) --------------- */
