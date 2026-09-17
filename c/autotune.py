@@ -382,7 +382,12 @@ class OutputDrift(RuntimeError):
 def _run(command: list[str], env: dict, timeout: int) -> subprocess.CompletedProcess:
     if Path(command[0]).suffix.lower() == ".py":
         command = [sys.executable, *command]
-    return subprocess.run(command, env=env, text=True, capture_output=True, timeout=timeout)
+    # The engine writes UTF-8 ("[prefill] layer 1/78 · 12 token", the PROF
+    # verdict's em dash). Decoding in the locale's code page raised in the
+    # reader thread on cp949/cp932 or the C locale, left proc.stdout None, and
+    # killed `coli tune` in calibration with a TypeError.
+    return subprocess.run(command, env=env, capture_output=True, timeout=timeout,
+                          encoding="utf-8", errors="replace")
 
 
 def create_replay(engine: str, cap: int, env: dict, prompt: str, tokens: int,

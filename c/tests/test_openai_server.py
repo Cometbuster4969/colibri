@@ -1181,10 +1181,14 @@ class CapSentinelShimTest(unittest.TestCase):
             self._spawn_argv("engine", str(model))
 
     def test_cap_for_arch_is_the_single_translation_point(self):
+        # 0 is the "you decide" sentinel, and it goes to the engines that
+        # actually do decide: glm resolves it platform-aware, olmoe sizes its
+        # expert cache from the RAM budget once the dense weights are resident
+        # (#1443). The others still get the legacy eight slots per layer.
         self.assertEqual(cap_for_arch("glm", None), 0)
+        self.assertEqual(cap_for_arch("olmoe", None), 0)
         self.assertEqual(cap_for_arch("inkling", None), 8)
         self.assertEqual(cap_for_arch("kimi", None), 8)
-        self.assertEqual(cap_for_arch("olmoe", None), 8)
         self.assertEqual(cap_for_arch("glm", 3), 3)
         self.assertEqual(cap_for_arch("inkling", 3), 3)
         self.assertEqual(cap_for_arch("inkling", 0), 0)   # explicit 0 is explicit
@@ -2024,6 +2028,21 @@ class ThinkingSplitUnitTest(unittest.TestCase):
         self.assertEqual(split_thinking_reply("plain answer", enable_thinking=False),
                          ("", "plain answer"))
 
+    def test_glm53_starts_in_reasoning_even_with_thinking_off(self):
+        """#1278: render_chat_glm53 opens <think> unconditionally (the template
+        has no switch; "off" only lowers the effort), so the reply always starts
+        inside the block. With the splitter started in text mode the reasoning
+        streamed as `content`, glued in front of the answer. The family, not the
+        client flag, decides where the output starts."""
+        import openai_server as srv
+        with patch("openai_server.ARCH", "glm53"):
+            self.assertTrue(srv.starts_in_reasoning(False))
+            self.assertEqual(split_thinking_reply("why</think>answer", enable_thinking=False),
+                             ("why", "answer"))
+        with patch("openai_server.ARCH", "glm"):
+            self.assertFalse(srv.starts_in_reasoning(False),
+                             "GLM-5.2 closes the block in the prompt when thinking is off")
+
     def test_missing_close_tag_surfaces_reasoning(self):
         self.assertEqual(split_thinking_reply("thought with no end"),
                          ("thought with no end", ""))
@@ -2569,8 +2588,10 @@ class ReasoningEffortTest(unittest.TestCase):
 
 
 class ImageUrlPathGuard(unittest.TestCase):
-    """image_url.url points at a local file read with the server's rights.
-    A '..' path is refused; COLI_IMAGE_ROOT confines reads; errors stay
+    """image_url.url naming a local file is read with the server's rights, so
+    it is denied unless the operator sets COLI_IMAGE_ROOT, and then only
+    inside it (GHSA follow-up to #1354, whose guards left every absolute path
+    readable by default). data: URIs are the client's way in. Errors stay
     generic so a reply never confirms a path or its permissions."""
 
     def setUp(self):
@@ -2581,31 +2602,62 @@ class ImageUrlPathGuard(unittest.TestCase):
         if self._saved is not None:
             os.environ["COLI_IMAGE_ROOT"] = self._saved
 
-    def test_reads_a_plain_file_by_default(self):
+    def test_data_uri_is_the_default_way_in(self):
+        import base64
+        payload = base64.b64encode(b"\x89PNG\r\n").decode()
+        self.assertEqual(_image_bytes_from_url("data:image/png;base64," + payload), b"\x89PNG\r\n")
+
+    def test_local_paths_are_denied_by_default(self):
         with tempfile.TemporaryDirectory() as root:
             img = Path(root) / "pic.png"
             img.write_bytes(b"\x89PNG\r\n")
-            self.assertEqual(_image_bytes_from_url(str(img)), b"\x89PNG\r\n")
-            self.assertEqual(_image_bytes_from_url("file://" + str(img)),
-                             b"\x89PNG\r\n")
+            for url in (str(img), "file://" + str(img), "/etc/passwd", "file:///etc/passwd", "relative.png"):
+                with self.assertRaises(APIError) as caught:
+                    _image_bytes_from_url(url)
+                self.assertEqual(caught.exception.status, 400)
+                self.assertIn("COLI_IMAGE_ROOT", str(caught.exception))
+                self.assertNotIn("passwd", str(caught.exception))
 
-    def test_dotdot_is_refused(self):
-        with self.assertRaises(APIError) as caught:
-            _image_bytes_from_url("/var/data/../../etc/passwd")
-        self.assertEqual(caught.exception.status, 400)
-        self.assertNotIn("passwd", str(caught.exception))
-
-    def test_image_root_confines_reads(self):
+    def test_image_root_allows_inside_and_refuses_outside(self):
         with tempfile.TemporaryDirectory() as root, \
-                tempfile.NamedTemporaryFile() as outside:
+                tempfile.NamedTemporaryFile(suffix=".png") as outside:
             os.environ["COLI_IMAGE_ROOT"] = root
             inside = Path(root) / "ok.png"
             inside.write_bytes(b"ok")
             self.assertEqual(_image_bytes_from_url(str(inside)), b"ok")
+            self.assertEqual(_image_bytes_from_url("file://" + str(inside)), b"ok")
+            for url in (outside.name, "/etc/passwd", str(Path(root) / ".." / Path(outside.name).name)):
+                with self.assertRaises(APIError) as caught:
+                    _image_bytes_from_url(url)
+                self.assertNotIn(Path(outside.name).name, str(caught.exception))
+
+    def test_a_symlink_escaping_the_root_is_refused(self):
+        if not hasattr(os, "symlink"):
+            self.skipTest("no symlinks here")
+        with tempfile.TemporaryDirectory() as root, \
+                tempfile.NamedTemporaryFile(suffix=".png") as outside:
+            os.environ["COLI_IMAGE_ROOT"] = root
+            link = Path(root) / "link.png"
+            try:
+                os.symlink(outside.name, link)
+            except OSError:
+                self.skipTest("cannot create symlinks here")
             with self.assertRaises(APIError):
-                _image_bytes_from_url(outside.name)
+                _image_bytes_from_url(str(link))
+
+    def test_a_missing_or_file_root_denies_everything(self):
+        with tempfile.TemporaryDirectory() as root:
+            img = Path(root) / "pic.png"
+            img.write_bytes(b"x")
+            os.environ["COLI_IMAGE_ROOT"] = str(Path(root) / "nowhere")
+            with self.assertRaises(APIError):
+                _image_bytes_from_url(str(img))
+            os.environ["COLI_IMAGE_ROOT"] = str(img)
+            with self.assertRaises(APIError):
+                _image_bytes_from_url(str(img))
 
     def test_error_does_not_leak_the_path(self):
+        os.environ["COLI_IMAGE_ROOT"] = tempfile.gettempdir()
         with self.assertRaises(APIError) as caught:
             _image_bytes_from_url("/no/such/secret-name.png")
         self.assertNotIn("secret-name", str(caught.exception))
