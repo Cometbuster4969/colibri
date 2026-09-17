@@ -21,20 +21,6 @@ USO:
                       --tasks hellaswag,arc_challenge,mmlu --limit 40 --ram 15
   # leve di ricerca: passate al motore via env
   TOPP=0.9 python3 tools/eval_glm.py --snap /path/to/glm52_i4 --data ./bench --tasks mmlu --ram 15
-
-Evidence binding (current limitation): this harness always sets
-SCORE_EVIDENCE=1 in the child environment and always tries to bind each
-SCORE result to the exact request bytes that produced it by digest. Only
-an engine build that prints the identity-bound wire form -- "SCORE
-<ordinal> <sha256-of-request-line> <exact> <contlen> <greedy>" -- can
-satisfy that binding; SCORE_EVIDENCE is a plain, unread environment
-variable to every other engine build, harmless to set. When the engine
-instead prints only the byte-compatible legacy three-field form ("<exact>
-<contlen> <greedy>", no identity prefix), the run still completes
-normally and every row is still written, but the results are UNBOUND --
-marked as such in the output file's summary line and announced once on
-stderr -- rather than silently treated as bound. A stream that mixes both
-forms in one run is refused with a named error instead of guessed at.
 """
 import argparse
 import hashlib
@@ -92,9 +78,6 @@ _C17G_TEXT = (r"-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?"
               r"(?:e[+-](?:0[0-9]|[1-9][0-9]{1,2}))?")
 _SCORE_RE = re.compile(
     rf"^({_C17G_TEXT}) ({_UINT_TEXT}) ([01])$")
-_SCORE_EVIDENCE_RE = re.compile(
-    rf"^SCORE ({_UINT_TEXT}) ([0-9a-f]{{64}}) "
-    rf"({_C17G_TEXT}) ({_UINT_TEXT}) ([01])$")
 
 
 def _checked_engine_text_size(length, label):
@@ -158,19 +141,6 @@ def parse_score_result(line):
     return exact, value, contlen, greedy
 
 
-def parse_score_evidence_result(line):
-    """Return the strict ordinal/digest identity plus the SCORE payload."""
-    match = _SCORE_EVIDENCE_RE.fullmatch(line)
-    if not match:
-        raise EvidenceError(f"not an exact evidence SCORE record: {line!r}")
-    ordinal_text, digest, exact, contlen_text, greedy_text = match.groups()
-    ordinal = int(ordinal_text)
-    if ordinal > _INT32_MAX:
-        raise EvidenceError(f"SCORE request ordinal is outside int32: {line!r}")
-    parsed = parse_score_result(f"{exact} {contlen_text} {greedy_text}")
-    return ordinal, digest, *parsed
-
-
 def classify_score_stdout(raw_line):
     """Accept one exact newline-terminated production stdout record."""
     if (not raw_line.endswith("\n") or raw_line.count("\n") != 1 or
@@ -191,18 +161,6 @@ def classify_score_stdout(raw_line):
 class ScoreStdoutClassifier:
     """Own exactly one banner then one load record before SCORE results.
 
-    Only an engine build that prints the identity-bound wire form
-    (``SCORE <ordinal> <sha256-of-request-line> <exact> <contlen>
-    <greedy>``) lets results be BOUND to their originating request by
-    digest. An engine that prints only the byte-compatible legacy form
-    (``<exact> <contlen> <greedy>``, no identity prefix) is still a
-    complete, honest run -- this is not a failure -- but nothing ties any
-    individual result back to the request that produced it, so the run's
-    results are UNBOUND. The two forms are never silently conflated: a
-    stream that starts in one form and switches to the other mid-run
-    (the classic case would be corrupted/interleaved output) is refused
-    with a named error rather than guessed at.
-
     Beyond the banner/load preamble, no other multiplexed-serve global
     record (``PROF``, ``HITS``, ``EMAP``, ...) or stderr-only banner
     (``[prefill]``, ``[PIN]``, ``[USAGE]``, ...) can ever reach this
@@ -212,17 +170,8 @@ class ScoreStdoutClassifier:
     recognized or passed through.
     """
 
-    def __init__(self, request_digests=None):
+    def __init__(self):
         self._state = 0
-        self._request_digests = (None if request_digests is None
-                                 else tuple(request_digests))
-        self._result_index = 0
-        self._mode = None  # None (no SCORE record yet) | "bound" | "unbound"
-
-    @property
-    def binding_mode(self):
-        """"bound", "unbound", or None if no SCORE record was classified."""
-        return self._mode
 
     def classify(self, raw_line):
         if (not raw_line.endswith("\n") or raw_line.count("\n") != 1 or
@@ -246,45 +195,12 @@ class ScoreStdoutClassifier:
             raise EvidenceError(str(exc)) from exc
         if preamble is not None:
             raise EvidenceError(f"duplicate/out-of-order SCORE preamble: {line!r}")
-        if self._request_digests is None:
-            return parse_score_result(line)
-        is_bound_shape = _SCORE_EVIDENCE_RE.fullmatch(line) is not None
-        is_unbound_shape = not is_bound_shape and _SCORE_RE.fullmatch(line) is not None
-        if not is_bound_shape and not is_unbound_shape:
-            raise EvidenceError(f"not an exact SCORE record: {line!r}")
-        line_mode = "bound" if is_bound_shape else "unbound"
-        if self._mode is None:
-            self._mode = line_mode
-        elif self._mode != line_mode:
-            raise EvidenceError(
-                "SCORE stream mixes identity-bound and legacy records: "
-                f"{line!r}")
-        if line_mode == "unbound":
-            self._result_index += 1
-            return parse_score_result(line)
-        ordinal, digest, exact, value, contlen, greedy = \
-            parse_score_evidence_result(line)
-        if self._result_index >= len(self._request_digests):
-            raise EvidenceError("engine emitted extra evidence SCORE result lines")
-        if ordinal != self._result_index:
-            raise EvidenceError(
-                f"SCORE request ordinal {ordinal} != expected {self._result_index}")
-        expected_digest = self._request_digests[self._result_index]
-        if digest != expected_digest:
-            raise EvidenceError(
-                f"SCORE request {ordinal} digest does not match exact request bytes")
-        self._result_index += 1
-        return exact, value, contlen, greedy
+        return parse_score_result(line)
 
     def finish(self):
         if self._state != 2:
             missing = "engine banner" if self._state == 0 else "engine load record"
             raise EvidenceError(f"missing {missing} before SCORE EOF")
-        if (self._mode == "bound" and self._request_digests is not None and
-                self._result_index != len(self._request_digests)):
-            raise EvidenceError(
-                f"only {self._result_index}/{len(self._request_digests)} "
-                "identity-bound SCORE records")
 
 
 def completion_error(returncode, completed, expected, continuation_tokens,
@@ -526,7 +442,7 @@ def main():
         print("DRY: request construction and tokenization passed. Engine was not run.", file=sys.stderr); return
     try:
         score_vocab = score_snapshot_vocab(a.snap)
-        _, request_payload, request_digests = score_request_wire(
+        _, request_payload, _ = score_request_wire(
             reqs, score_vocab)
     except EvidenceError as exc:
         return prelaunch_incomplete(a.out, str(exc))
@@ -538,7 +454,7 @@ def main():
         written = f.write(request_payload)
         if written != len(request_payload):
             raise EvidenceError("short write while freezing SCORE requests")
-    env = dict(os.environ, SNAP=a.snap, SCORE=req_path, SCORE_EVIDENCE="1")
+    env = dict(os.environ, SNAP=a.snap, SCORE=req_path)
     if a.ram: env["RAM_GB"] = str(a.ram)
     cmd = [a.glm, str(a.cap)] + a.bits.split()
     print("running:", " ".join(cmd), file=sys.stderr)
@@ -572,7 +488,7 @@ def main():
         n_done = 0
         continuation_tokens = 0
         stream_error = None
-        stdout_classifier = ScoreStdoutClassifier(request_digests)
+        stdout_classifier = ScoreStdoutClassifier()
         # Drain stderr (engine progress lines) to console live on a background thread
         # so the [score N req] heartbeat is visible while stdout is consumed below.
         def _drain_stderr():
@@ -619,7 +535,6 @@ def main():
                 stdout_classifier.finish()
             except EvidenceError as exc:
                 stream_error = exc
-        binding_mode = stdout_classifier.binding_mode
         proc.wait()
         elapsed = time.time() - t0
         # Fatal only in the two cases dev's own contract (and this
@@ -629,7 +544,6 @@ def main():
         fatal = completion_error(
             proc.returncode,n_done,len(reqs),continuation_tokens,stream_error)
         partial = n_done != len(reqs)
-        evidence_status = "BOUND" if binding_mode == "bound" else "UNBOUND"
         if out_f:
             if fatal:
                 out_f.write(f"# INCOMPLETE: {n_done}/{len(reqs)} in {elapsed:.0f}s, "
@@ -637,8 +551,7 @@ def main():
                             f"error={fatal}\n")
             else:
                 out_f.write(f"# finished: {n_done}/{len(reqs)} in {elapsed:.0f}s, "
-                            f"tokens={continuation_tokens}, exit={proc.returncode}, "
-                            f"evidence={evidence_status}\n")
+                            f"tokens={continuation_tokens}, exit={proc.returncode}\n")
                 if partial:
                     # Additive: the run still finished (exit 0, full
                     # table below) -- this line only ANNOUNCES that fewer
@@ -651,9 +564,6 @@ def main():
         if fatal:
             print(f"EVIDENCE INCOMPLETE: {fatal}", file=sys.stderr)
             return 1
-        if evidence_status == "UNBOUND":
-            print("engine does not emit score evidence lines; "
-                  "results are unbound", file=sys.stderr)
         if partial:
             # Same wording and the same exit-0 contract dev used: a
             # partial run is a WARNING, not a failure.

@@ -2,11 +2,10 @@
 records and refuse everything else with a named error: an unparsed or
 duplicated banner/load preamble, a SCORE line whose numeric token is not
 the canonical finite ``%.6f``/``%.17g`` spelling the engine actually
-emits, a replayed or out-of-order identity-bound evidence record, and a
-foreign stdout line that is neither a preamble nor a SCORE record. It
-must also write result rows incrementally (one flush per request, never
-buffered until completion) and mark incomplete runs, including a
-pre-launch refusal, before the engine is ever started.
+emits, and a foreign stdout line that is neither a preamble nor a SCORE
+record. It must also write result rows incrementally (one flush per
+request, never buffered until completion) and mark incomplete runs,
+including a pre-launch refusal, before the engine is ever started.
 
 Checks enumerated from the source (`tools/eval_glm.py`, read in full
 before writing this module) and covered below, grouped by the function
@@ -26,11 +25,6 @@ that performs them:
   by name -- a foreign line is never silently treated as a score, which
   is exactly the defect dev's plain ``line[0] in "-0123456789"`` filter
   does not catch (differential bite, below).
-- identity-bound evidence mode (``ScoreStdoutClassifier(request_digests)``):
-  strict ordinal join, digest binding, replay/duplicate/out-of-order/
-  extra-record refusal; a stream that mixes identity-bound and legacy
-  records refuses by name; a legacy-only stream still completes, marked
-  UNBOUND rather than silently treated as bound.
 - `score_request_wire`: strict ASCII/LF request grammar, the per-record
   SHA-256 digest, and the inclusive 256 MiB engine text limit shared with
   `check_ablate_evidence.py`.
@@ -101,7 +95,7 @@ class EvalGlmEvidenceTests(unittest.TestCase):
                 f"layers={layers} experts={experts} | MTP {state} "
                 f"(draft={draft})")
 
-    def run_eval_main(self, stdout_records, bind_evidence=True):
+    def run_eval_main(self, stdout_records):
         class Encoded:
             ids = [1, 2]
 
@@ -114,18 +108,8 @@ class EvalGlmEvidenceTests(unittest.TestCase):
             def encode(text):
                 return Encoded()
 
-        request_raw = b"2 2 1 2 1 2\n"
-        request_digest = hashlib.sha256(request_raw).hexdigest()
-        bound_records = []
-        score_index = 0
-        for record in stdout_records:
-            line = record[:-1] if record.endswith("\n") else record
-            if bind_evidence and EVAL._SCORE_RE.fullmatch(line):
-                record = f"SCORE {score_index} {request_digest} {line}\n"
-                score_index += 1
-            bound_records.append(record)
         process = types.SimpleNamespace(
-            returncode=0, stderr=(), stdout=tuple(bound_records),
+            returncode=0, stderr=(), stdout=tuple(stdout_records),
             wait=lambda: 0, poll=lambda: 0, terminate=lambda: None)
         with tempfile.TemporaryDirectory() as tmp:
             output = pathlib.Path(tmp) / "results.csv"
@@ -318,7 +302,6 @@ class EvalGlmEvidenceTests(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertEqual(launches, 1)
         self.assertIn("# finished: 3/3", output)
-        self.assertEqual(self.last_popen_kwargs["env"]["SCORE_EVIDENCE"], "1")
 
     def test_result_rows_are_written_and_flushed_incrementally(self):
         # A run interrupted mid-task must leave a valid partial file --
@@ -326,8 +309,6 @@ class EvalGlmEvidenceTests(unittest.TestCase):
         # the run completes. Simulate a mid-run crash by having the fake
         # engine's stdout iterator raise after the first scored record;
         # the CSV must already contain that row.
-        request_raw = b"2 2 1 2 1 2\n"
-        request_digest = hashlib.sha256(request_raw).hexdigest()
 
         class Encoded:
             ids = [1, 2]
@@ -353,8 +334,8 @@ class EvalGlmEvidenceTests(unittest.TestCase):
 
         stdout_lines = [
             self.BANNER + "\n", self.loaded("absent", 2) + "\n",
-            f"SCORE 0 {request_digest} -1 2 1\n",
-            f"SCORE 1 {request_digest} -2 2 0\n",
+            "-1 2 1\n",
+            "-2 2 0\n",
         ]
         process = types.SimpleNamespace(
             returncode=1, stderr=(), stdout=CrashingStdout(stdout_lines),
@@ -542,149 +523,35 @@ class EvalGlmEvidenceTests(unittest.TestCase):
         self.assertGreaterEqual(process.wait_calls, 1)
         self.assertEqual(signal.getsignal(signal.SIGTERM), previous_handler)
 
-    def test_identity_bound_score_join_rejects_replay_and_order_mutations(self):
-        requests = (b"1 1 1 2\n", b"1 1 1 3\n", b"1 1 1 4\n")
-        digests = tuple(hashlib.sha256(raw).hexdigest()
-                        for raw in requests)
-
-        def record(ordinal, digest_index, score="-1"):
-            return (f"SCORE {ordinal} {digests[digest_index]} "
-                    f"{score} 1 1\n")
-
-        control = EVAL.ScoreStdoutClassifier(digests)
-        self.assertIsNone(control.classify(self.BANNER + "\n"))
-        self.assertIsNone(control.classify(self.loaded("absent", 2) + "\n"))
-        for index in range(3):
-            self.assertEqual(control.classify(record(index, index))[0], "-1")
-        control.finish()
-
-        cases = {
-            "replay_digest": (record(0, 0), record(1, 0)),
-            "duplicate_ordinal": (record(0, 0), record(0, 1)),
-            "out_of_order": (record(1, 1),),
-            # NOTE: a bare "-1 1 1\n" (no identity prefix) with no prior
-            # bound record is no longer an error here -- that is the
-            # legitimate legacy/UNBOUND path, covered by
-            # test_legacy_engine_completes_unbound below. Mix a legacy
-            # line into an ALREADY-bound stream instead, which is still
-            # refused (test_mixed_bound_and_legacy_stream_refuses).
-            "extra": (record(0, 0), record(1, 1), record(2, 2),
-                      record(3, 2)),
-        }
-        for name, records in cases.items():
-            with self.subTest(name=name):
-                parser = EVAL.ScoreStdoutClassifier(digests)
-                parser.classify(self.BANNER + "\n")
-                parser.classify(self.loaded("absent", 2) + "\n")
-                with self.assertRaises(EVAL.EvidenceError):
-                    for value in records:
-                        parser.classify(value)
-                    parser.finish()
-
-    def test_wrong_digest_at_a_correct_ordinal_is_refused_mid_stream(self):
-        # Isolates digest binding from the record-count completeness
-        # check above: exactly len(digests) records land at the right
-        # ordinals (so a count-only bug would stay quiet), but the
-        # second record's digest belongs to a different request.
-        requests = (b"1 1 1 2\n", b"1 1 1 3\n", b"1 1 1 4\n")
-        digests = tuple(hashlib.sha256(raw).hexdigest()
-                        for raw in requests)
-
-        def record(ordinal, digest_index, score="-1"):
-            return (f"SCORE {ordinal} {digests[digest_index]} "
-                    f"{score} 1 1\n")
-
-        parser = EVAL.ScoreStdoutClassifier(digests)
-        parser.classify(self.BANNER + "\n")
-        parser.classify(self.loaded("absent", 2) + "\n")
-        parser.classify(record(0, 0))
-        with self.assertRaisesRegex(
-                EVAL.EvidenceError,
-                "digest does not match exact request bytes"):
-            parser.classify(record(1, 2))  # ordinal 1, wrong digest (index 2)
-
-    def test_legacy_engine_completes_unbound(self):
-        # An engine that never emits the identity-bound
-        # "SCORE <ordinal> <digest> ..." prefix -- only
-        # the byte-compatible legacy three-field form -- is not a
-        # failure. The run completes, every row is written, and the
-        # result is marked UNBOUND (never silently treated as bound).
+    def test_engine_run_completes_and_reports_finished(self):
+        # The engine only ever emits the byte-compatible legacy
+        # three-field form ("<exact> <contlen> <greedy>"); a clean run
+        # over that form completes and writes every row.
         rc, output, launches = self.run_eval_main((
             self.BANNER + "\n",
             self.loaded("absent", 2) + "\n",
             "-1 2 1\n", "-2 2 0\n", "-3 2 0\n",
-        ), bind_evidence=False)
+        ))
         self.assertEqual(rc, 0)
         self.assertEqual(launches, 1)
         self.assertIn("# finished: 3/3", output)
-        self.assertIn("evidence=UNBOUND", output)
-        self.assertNotIn("evidence=BOUND", output)
-        # SCORE_EVIDENCE is still set for the child -- harmless to an
-        # engine that never reads it (confirmed: dev's run_score has no
-        # getenv("SCORE_EVIDENCE") call at all).
-        self.assertEqual(self.last_popen_kwargs["env"]["SCORE_EVIDENCE"], "1")
-        # The UNBOUND stderr announcement must actually be
-        # printed, not just the output-file marker -- an operator
-        # watching a live run only sees stderr.
-        self.assertIn(
-            "engine does not emit score evidence lines; results are unbound",
-            self.last_stderr)
 
-    def test_evidence_engine_completes_bound(self):
-        rc, output, launches = self.run_eval_main((
-            self.BANNER + "\n",
-            self.loaded("absent", 2) + "\n",
-            "-1 2 1\n", "-2 2 0\n", "-3 2 0\n",
-        ), bind_evidence=True)
-        self.assertEqual(rc, 0)
-        self.assertEqual(launches, 1)
-        self.assertIn("# finished: 3/3", output)
-        self.assertIn("evidence=BOUND", output)
-        self.assertNotIn("evidence=UNBOUND", output)
-        # A bound run must never print the unbound announcement.
-        self.assertNotIn("results are unbound", self.last_stderr)
-
-    def test_mixed_bound_and_legacy_stream_refuses(self):
-        requests = (b"1 1 1 2\n", b"1 1 1 3\n")
-        digests = tuple(hashlib.sha256(raw).hexdigest()
-                        for raw in requests)
-        parser = EVAL.ScoreStdoutClassifier(digests)
-        parser.classify(self.BANNER + "\n")
-        parser.classify(self.loaded("absent", 2) + "\n")
-        parser.classify(f"SCORE 0 {digests[0]} -1 1 1\n")  # bound
-        with self.assertRaisesRegex(
-                EVAL.EvidenceError,
-                "mixes identity-bound and legacy records"):
-            parser.classify("-2 1 0\n")  # legacy, mid-stream switch
-
-        # Also refused the other way around: legacy first, then bound.
-        parser2 = EVAL.ScoreStdoutClassifier(digests)
-        parser2.classify(self.BANNER + "\n")
-        parser2.classify(self.loaded("absent", 2) + "\n")
-        parser2.classify("-2 1 0\n")  # legacy
-        with self.assertRaisesRegex(
-                EVAL.EvidenceError,
-                "mixes identity-bound and legacy records"):
-            parser2.classify(f"SCORE 1 {digests[1]} -1 1 1\n")  # bound
-
-    def test_digest_bound_classifier_refuses_unknown_lines(self):
-        # ScoreStdoutClassifier is the class main() actually
-        # constructs with request_digests -- classify_score_stdout (the
-        # standalone function, covered by test_stdout_grammar_refuses_
-        # unknown_records) is a separate code path main() never calls.
-        # A foreign line must be refused by the digest-bound classifier
-        # itself, not merely by the standalone function.
-        requests = (b"1 1 1 2\n",)
-        digests = tuple(hashlib.sha256(raw).hexdigest() for raw in requests)
+    def test_classifier_refuses_unknown_lines(self):
+        # ScoreStdoutClassifier is the class main() actually constructs
+        # -- classify_score_stdout (the standalone function, covered by
+        # test_stdout_grammar_refuses_unknown_records) is a separate
+        # code path main() never calls. A foreign line must be refused
+        # by the classifier itself, not merely by the standalone
+        # function.
         foreign_lines = (
             "PROF 0.001 1 1 0.000 0.000 0.000 0.000 0.000 1\n",
             "not a score line at all\n",
             "nan 1 0\n",
-            "1 1 1\n",  # positive logprob, shaped like a legacy record
+            "SCORE 0 " + "a" * 64 + " -1 1 1\n",  # no reader emits this shape
         )
         for line in foreign_lines:
             with self.subTest(line=line):
-                parser = EVAL.ScoreStdoutClassifier(digests)
+                parser = EVAL.ScoreStdoutClassifier()
                 parser.classify(self.BANNER + "\n")
                 parser.classify(self.loaded("absent", 2) + "\n")
                 with self.assertRaises(EVAL.EvidenceError):
@@ -882,7 +749,7 @@ class EvalGlmEvidenceTests(unittest.TestCase):
             self.BANNER + "\n",
             self.loaded("absent", 2) + "\n",
             "-1 2 1\n",  # only 1 of 3 requests scored
-        ), bind_evidence=False)
+        ))
         self.assertEqual(rc, 0)
         self.assertEqual(launches, 1)
         self.assertIn("# finished: 1/3", output)
