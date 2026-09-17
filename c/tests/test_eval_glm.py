@@ -149,6 +149,18 @@ class EvalGlmEvidenceTests(unittest.TestCase):
         self.assertEqual(value, -8.553458)
         self.assertEqual((contlen, greedy), (4096, 1))
 
+    def test_direct_call_rejects_trailing_newline_record(self):
+        # See parse_score_result's own docstring: _SCORE_RE's "$" anchor
+        # matches just before a trailing "\n" as well as at true
+        # end-of-string, so fullmatch -> match/search would accept a
+        # newline-terminated record fullmatch correctly rejects. The
+        # classifier's own callers strip the newline first and are
+        # provably out of reach of this (see the docstring), but this
+        # function is also called directly -- pin the direct-call
+        # contract so a future weakening doesn't slip in unnoticed there.
+        with self.assertRaises(EVAL.EvidenceError):
+            EVAL.parse_score_result("-8.553458 4096 1\n")
+
     def test_parse_c17g_rejects_trailing_garbage(self):
         # parse_c17g is only ever reached, elsewhere in this module,
         # through _SCORE_RE's own "^...$"-anchored capture group, which
@@ -357,6 +369,62 @@ class EvalGlmEvidenceTests(unittest.TestCase):
         # than raise at all.
         self.assertFalse(EVAL.is_score_preamble(banner.rstrip("\n")))
 
+    def test_oversized_vocab_json_refuses_as_evidence_error(self):
+        # Same error-contract class as F3, in a different function:
+        # json.loads() raises a bare ValueError (not its
+        # json.JSONDecodeError subclass) for an integer literal beyond
+        # Python's 4300-digit int-string conversion limit, which
+        # score_snapshot_vocab's except clause did not catch -- the
+        # bare ValueError escaped main()'s only try/except around this
+        # call (which catches EvidenceError to write the INCOMPLETE
+        # marker and return before ever launching the engine), so
+        # main() crashed outright with NO INCOMPLETE marker written at
+        # all, worse than the ordinary prelaunch-refusal contract every
+        # other pre-engine-launch failure gets.
+        huge_vocab = "1" + "0" * 4300
+        with tempfile.TemporaryDirectory() as tmp:
+            (pathlib.Path(tmp) / "config.json").write_text(
+                '{"vocab_size": ' + huge_vocab + '}\n')
+            with self.assertRaises(EVAL.EvidenceError):
+                EVAL.score_snapshot_vocab(tmp)
+
+    def test_oversized_vocab_json_marks_incomplete_end_to_end(self):
+        # The end-to-end contract test_oversized_vocab_json_refuses_
+        # as_evidence_error's unit-level pin implies: main() must reach
+        # prelaunch_incomplete() (INCOMPLETE marker written, engine
+        # never launched, exit 1) rather than crash uncaught.
+        class Encoded:
+            ids = [1, 2]
+
+        class FakeTokenizer:
+            @staticmethod
+            def from_file(path):
+                return FakeTokenizer()
+
+            @staticmethod
+            def encode(text):
+                return Encoded()
+
+        huge_vocab = "1" + "0" * 4300
+        with tempfile.TemporaryDirectory() as tmp:
+            output = pathlib.Path(tmp) / "results.csv"
+            (pathlib.Path(tmp) / "config.json").write_text(
+                '{"vocab_size": ' + huge_vocab + '}\n')
+            argv = [
+                "eval_glm.py", "--snap", tmp, "--tasks", "smoke",
+                "--limit", "1", "--glm", "/fake/glm", "--out",
+                str(output),
+            ]
+            tokenizers = types.SimpleNamespace(Tokenizer=FakeTokenizer)
+            with mock.patch.object(sys, "argv", argv), \
+                    mock.patch.dict(sys.modules, {"tokenizers": tokenizers}), \
+                    mock.patch.object(
+                        EVAL.subprocess, "Popen",
+                        side_effect=AssertionError("engine launched")):
+                rc = EVAL.main()
+            self.assertEqual(rc, 1)
+            self.assertIn("# INCOMPLETE:", output.read_text())
+
     def test_banner_kernels_and_load_boundaries_are_exact(self):
         self.assertEqual(
             EVAL.parse_engine_banner(self.BANNER)["kernel"], "neon-i8mm")
@@ -470,6 +538,93 @@ class EvalGlmEvidenceTests(unittest.TestCase):
             self.assertIn(
                 "# INCOMPLETE: evaluator terminated before a complete "
                 "denominator", text)
+
+    def test_row_is_durable_on_disk_before_the_run_finishes(self):
+        # test_result_rows_are_written_and_flushed_incrementally (above)
+        # is named for the per-row flush but cannot actually detect
+        # losing it: that test reads the output file only AFTER
+        # EVAL.main() has unwound through its `finally` block, which
+        # closes out_f (and Python flushes a file on close) regardless
+        # of whether any PER-ROW flush ever ran. It defends the ARTIFACT
+        # after a clean-ish exit, not the PROPERTY of durability DURING
+        # the run.
+        #
+        # This test instead opens a SECOND, independent file handle on
+        # the same path while main() is still running (has not
+        # returned) and reads through it -- a second handle can only
+        # see bytes actually flushed to the OS by the writer, never
+        # bytes still sitting only in the writer's own buffer. The
+        # probe runs from inside the fake stdout generator, resumed
+        # only once the consumer (main()'s per-line loop body, including
+        # write_result_row + out_f.flush() for that line) has fully
+        # finished with the PREVIOUS line and is asking for the next one
+        # -- so a snapshot taken there reflects exactly what has been
+        # made durable so far, mid-run.
+        class Encoded:
+            ids = [1, 2]
+
+        class FakeTokenizer:
+            @staticmethod
+            def from_file(path):
+                return FakeTokenizer()
+
+            @staticmethod
+            def encode(text):
+                return Encoded()
+
+        class ProbingStdout:
+            def __init__(self, lines, probe_path):
+                self._lines = list(lines)
+                self._probe_path = probe_path
+                self.snapshots = []
+
+            def __iter__(self):
+                for line in self._lines:
+                    yield line
+                    try:
+                        with open(self._probe_path) as f:
+                            self.snapshots.append(f.read())
+                    except FileNotFoundError:
+                        self.snapshots.append("")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            output = pathlib.Path(tmp) / "results.csv"
+            (pathlib.Path(tmp) / "config.json").write_text(
+                '{"vocab_size":3}\n')
+            stdout = ProbingStdout((
+                self.BANNER + "\n",
+                self.loaded("absent", 2) + "\n",
+                "-1 2 1\n",
+                "-2 2 0\n",
+            ), str(output))
+            process = types.SimpleNamespace(
+                returncode=0, stderr=(), stdout=stdout,
+                wait=lambda: 0, poll=lambda: 0, terminate=lambda: None)
+            argv = [
+                "eval_glm.py", "--snap", tmp, "--tasks", "smoke",
+                "--limit", "1", "--glm", "/fake/glm", "--out",
+                str(output),
+            ]
+            tokenizers = types.SimpleNamespace(Tokenizer=FakeTokenizer)
+            with mock.patch.object(sys, "argv", argv), \
+                    mock.patch.dict(sys.modules, {"tokenizers": tokenizers}), \
+                    mock.patch.object(EVAL.subprocess, "Popen",
+                                      return_value=process):
+                rc = EVAL.main()
+            self.assertEqual(rc, 0)
+        # snapshots[0]/[1]: after the banner/load preamble lines, before
+        # any SCORE result -- no row yet.
+        self.assertNotIn(",-1,1\n", stdout.snapshots[0].replace(".000000", ""))
+        self.assertNotIn(",-1,1\n", stdout.snapshots[1].replace(".000000", ""))
+        # snapshots[2]: taken right after the FIRST SCORE line was fully
+        # processed but BEFORE the second one is even requested --
+        # main() has not returned. The first row must already be
+        # readable through the independent handle; the second must not.
+        first_row_snapshot = stdout.snapshots[2].replace(".000000", "")
+        self.assertIn(",-1,1\n", first_row_snapshot,
+                      "first row not durable before the run finished -- "
+                      "the per-row flush is not doing its job")
+        self.assertNotIn(",-2,0\n", first_row_snapshot)
 
     def test_child_is_terminated_on_mid_run_interrupt_or_exception(self):
         # SIGINT/SIGTERM/any exception mid-run must not leave the

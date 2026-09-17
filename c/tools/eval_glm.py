@@ -101,6 +101,22 @@ def parse_c17g(text):
     survive: neither spelling is finite-preserving for them) -- is
     refused.
     """
+    # fullmatch (not match/search) here is UNREACHABLE via the real
+    # production path: this function's only caller, parse_score_result,
+    # only ever passes the substring _SCORE_RE captured for this exact
+    # sub-pattern (_SCORE_RE embeds _C17G_TEXT verbatim as its first
+    # group), and a regex capture group's matched text always already
+    # satisfies the sub-pattern it was captured with -- fullmatch,
+    # match and search are identical for that input by construction,
+    # not merely by absence of a counterexample. For a DIRECT caller
+    # (this function is called directly elsewhere in this module's own
+    # tests) fullmatch vs. match/search is still equivalent in
+    # practice: RAN mutation testing (both variants, full suite) found
+    # every constructible counterexample (trailing garbage, a bare
+    # trailing ".", a single-digit exponent) independently rejected by
+    # the round-trip format comparison a few lines below regardless,
+    # since format(value, ...) can never reproduce a non-canonical
+    # tail. See test_parse_c17g_rejects_* for the direct-caller pins.
     if not isinstance(text, str) or not re.fullmatch(_C17G_TEXT, text):
         raise EvidenceError(f"not a canonical %.6f/%.17g token: {text!r}")
     try:
@@ -127,7 +143,25 @@ def is_score_preamble(line):
 
 
 def parse_score_result(line):
-    """Return (exact_text, value, contlen, greedy) for one complete SCORE line."""
+    """Return (exact_text, value, contlen, greedy) for one complete SCORE line.
+
+    fullmatch (not match/search) is UNREACHABLE-via-the-classifier for
+    the one input shape that could distinguish them: a `$` anchor (built
+    into _SCORE_RE's own pattern text) is zero-width and matches just
+    before a trailing "\\n" as well as at true end-of-string, so
+    match()/search() would accept a newline-terminated record that
+    fullmatch correctly rejects (this is exactly the M11-class gap
+    engine_evidence.py's own fullmatch calls had). classify_score_stdout
+    and ScoreStdoutClassifier.classify -- the only production callers --
+    both strip exactly one trailing newline before calling this function
+    and both refuse any OTHER embedded "\\n" first (`raw_line.count("\\n")
+    != 1`), so `line` here is guaranteed newline-free through that path:
+    the exploit cannot be entered. For a caller reaching this function
+    directly (as this module's own tests do), the newline-terminated
+    input is still refused today -- test_direct_call_rejects_trailing_
+    newline_record pins it so a future match()/search() weakening does
+    not go unnoticed on the direct-call path either.
+    """
     match = _SCORE_RE.fullmatch(line)
     if not match:
         raise EvidenceError(f"not an exact SCORE record: {line!r}")
@@ -238,12 +272,32 @@ def completion_error(returncode, completed, expected, continuation_tokens,
     positive token count by construction.
 
     ``stream_error`` is the one condition dev's own contract has no
-    analog for: a genuinely corrupted or self-inconsistent SCORE stream
-    (mixed identity-bound/legacy records, a replayed digest, an
-    out-of-vocabulary token, ...), which this module's evidence layer can
-    detect and dev's plain per-line filter cannot. That failure stays
-    fatal regardless of how many requests completed, because the parsed
-    numbers themselves are not trustworthy.
+    analog for: a genuinely corrupted or self-inconsistent SCORE stream,
+    which this module's evidence layer can detect and dev's plain
+    per-line filter cannot. Concretely, as of this module's current
+    stdout classifier: a foreign, malformed, or duplicated/out-of-order
+    banner-or-load preamble line; a SCORE line whose numeric token is
+    not an exact finite %.6f/%.17g spelling (a bare "nan"/"inf" included
+    -- neither survives either spelling); a completed request's contlen
+    not matching what that request actually asked for; more SCORE
+    result lines than requests were sent; or the stream ending before
+    both preamble records were ever seen. That failure stays fatal
+    regardless of how many requests completed, because once any one
+    line fails to parse as a complete, well-formed record, nothing
+    guarantees the corruption did not already touch earlier-looking-fine
+    rows too -- unlike the DATA/logprobs serving channel elsewhere in
+    this project, where a non-finite value on a masked row is expected
+    and reported, not fatal, this SCORE/benchmark channel has no such
+    legitimate non-finite case: a nan/inf SCORE value cannot be compared
+    against a benchmark's gold answer, and reporting an accuracy table
+    built partly from corrupted numbers is a wrong PASS, which this
+    module's whole design treats as worse than refusing to report at
+    all. (This docstring previously cited identity-bound-evidence
+    conditions -- mixed identity-bound/legacy records, a replayed
+    digest, an out-of-vocabulary token -- that no longer exist: the
+    identity-binding mode itself was removed as unsatisfiable by any
+    current engine build. The reasoning above is unchanged; only the
+    concrete list of what can still reach this path is corrected.)
     """
     if stream_error:
         return str(stream_error)
@@ -334,8 +388,16 @@ def score_snapshot_vocab(snap):
         _checked_engine_text_size(len(raw), "SCORE config.json")
         config = json.loads(raw.decode("utf-8"))
         vocab = config["vocab_size"]
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError,
+    except (OSError, UnicodeDecodeError, ValueError,
             KeyError, TypeError) as exc:
+        # ValueError (not just its json.JSONDecodeError subclass): a
+        # numeric literal in the JSON beyond Python's 4300-digit
+        # int-string conversion limit makes json.loads itself raise a
+        # bare ValueError, not JSONDecodeError -- same error-contract
+        # class as F3's engine_evidence fix. main()'s only caller
+        # catches EvidenceError to mark the run INCOMPLETE before ever
+        # launching the engine; a bare ValueError escaping here instead
+        # crashes main() outright with no INCOMPLETE marker written.
         raise EvidenceError(f"cannot derive SCORE vocabulary from {path}: {exc}") from exc
     if type(vocab) is not int or not 1 <= vocab <= 1 << 24:
         raise EvidenceError(f"invalid SCORE vocabulary in {path}: {vocab!r}")

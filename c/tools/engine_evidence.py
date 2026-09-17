@@ -108,26 +108,28 @@ def parse_engine_loaded(line):
 def parse_engine_preamble(line):
     """Dispatch to the banner/loaded parser by prefix, or return None.
 
-    "Starts like one of them" is a literal, mechanical prefix test
-    (``line.startswith("== GLM C engine")`` / ``line.startswith("loaded
-    in")``), not a semantic resemblance check: any line -- owned by this
-    engine or not -- that happens to share that literal prefix is routed
-    to the matching parser and, if it does not go on to match that
-    parser's exact grammar, raises PreambleError rather than being
-    treated as an ordinary unowned log line. This is deliberately
-    fail-loud (an unexpected line reaching this position is itself
-    worth surfacing), but it means the dispatch is broader than the two
-    records it is named for: "loaded index ..." also starts with
-    "loaded in" purely because "index" itself starts with "in", and
-    would be refused here even though it has nothing to do with the
-    engine's load-timing record. No engine anywhere in this tree emits
-    such a line today (confirmed against every "loaded"-prefixed printf
-    in the C sources) -- this note exists so a future line that
-    genuinely collides with the prefix is a documented, expected
-    refusal rather than a surprise.
+    Accepts only the two exact lines the engine actually prints at
+    startup -- the "== GLM C engine ..." banner and the "loaded in ..."
+    record that follows it -- each matched and range-checked field for
+    field. Every other line is refused: an ordinary line that shares
+    neither literal prefix returns None (see below); a line that DOES
+    share one of the two prefixes but does not go on to match that
+    parser's exact grammar raises PreambleError rather than being
+    treated as unowned.
 
-    None means the line did not even share one of the two literal
-    prefixes above.
+    The prefix test itself is mechanical, not semantic, which makes the
+    dispatch slightly broader than the two records it is named for:
+    "loaded index ..." also starts with "loaded in" purely because
+    "index" itself starts with "in", and would be routed to
+    parse_engine_loaded and refused there -- fail-loud, deliberately,
+    the same as any other line sharing the prefix without matching the
+    grammar. This is a documented characteristic, not a live concern:
+    no engine anywhere in this tree emits "loaded index" or any other
+    line that collides with either prefix today (confirmed against
+    every "loaded"-prefixed printf in the C sources), so there is
+    nothing to actually tolerate -- if a future engine change ever adds
+    one, this note is why the refusal is expected rather than a
+    surprise.
     """
     if not isinstance(line, str):
         raise PreambleError(f"engine preamble is not text: {line!r}")
