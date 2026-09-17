@@ -45,8 +45,17 @@ def parse_engine_banner(line):
     match = _BANNER_RE.fullmatch(line)
     if not match:
         raise PreambleError(f"not an exact engine banner: {line!r}")
-    cap, expert_bits, dense_bits = map(
-        int, match.group("cap", "expert_bits", "dense_bits"))
+    try:
+        cap, expert_bits, dense_bits = map(
+            int, match.group("cap", "expert_bits", "dense_bits"))
+    except ValueError as exc:
+        # _UINT_TEXT has no digit-count cap of its own, so a numeric
+        # field beyond Python's int-string conversion limit (4300
+        # digits by default) reaches here as a bare ValueError, not
+        # this module's own PreambleError -- every caller of this
+        # module refuses with a named error, never a crash.
+        raise PreambleError(f"engine banner field is not a valid integer: "
+                            f"{line!r}") from exc
     if not 1 <= cap <= _INT32_MAX:
         raise PreambleError(f"engine cache outside [1,{_INT32_MAX}]: {cap}")
     if not 1 <= expert_bits <= 16 or not 1 <= dense_bits <= 16:
@@ -65,10 +74,18 @@ def parse_engine_loaded(line):
     match = _LOADED_RE.fullmatch(line)
     if not match:
         raise PreambleError(f"not an exact engine load record: {line!r}")
-    load_s = float(match.group("load_s"))
-    resident_mb = float(match.group("resident_mb"))
-    layers, experts, draft = map(
-        int, match.group("layers", "experts", "draft"))
+    try:
+        load_s = float(match.group("load_s"))
+        resident_mb = float(match.group("resident_mb"))
+        layers, experts, draft = map(
+            int, match.group("layers", "experts", "draft"))
+    except ValueError as exc:
+        # Same rationale as parse_engine_banner: _FIXED2_TEXT/_UINT_TEXT
+        # have no digit-count cap, so a field beyond Python's
+        # int-string conversion limit reaches here as a bare
+        # ValueError, not this module's own PreambleError.
+        raise PreambleError(f"engine load record field is not a valid "
+                            f"number: {line!r}") from exc
     mtp = match.group("mtp")
     if not math.isfinite(load_s) or not math.isfinite(resident_mb):
         raise PreambleError("engine load metrics must be finite")
@@ -91,9 +108,26 @@ def parse_engine_loaded(line):
 def parse_engine_preamble(line):
     """Dispatch to the banner/loaded parser by prefix, or return None.
 
-    None means the line is not one of the two owned preambles at all (an
-    ordinary log line); a line that starts like one of them but fails to
-    parse still raises PreambleError rather than being treated as unowned.
+    "Starts like one of them" is a literal, mechanical prefix test
+    (``line.startswith("== GLM C engine")`` / ``line.startswith("loaded
+    in")``), not a semantic resemblance check: any line -- owned by this
+    engine or not -- that happens to share that literal prefix is routed
+    to the matching parser and, if it does not go on to match that
+    parser's exact grammar, raises PreambleError rather than being
+    treated as an ordinary unowned log line. This is deliberately
+    fail-loud (an unexpected line reaching this position is itself
+    worth surfacing), but it means the dispatch is broader than the two
+    records it is named for: "loaded index ..." also starts with
+    "loaded in" purely because "index" itself starts with "in", and
+    would be refused here even though it has nothing to do with the
+    engine's load-timing record. No engine anywhere in this tree emits
+    such a line today (confirmed against every "loaded"-prefixed printf
+    in the C sources) -- this note exists so a future line that
+    genuinely collides with the prefix is a documented, expected
+    refusal rather than a surprise.
+
+    None means the line did not even share one of the two literal
+    prefixes above.
     """
     if not isinstance(line, str):
         raise PreambleError(f"engine preamble is not text: {line!r}")

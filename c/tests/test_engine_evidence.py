@@ -9,6 +9,7 @@ matching without a local, fast failure.
 import unittest
 
 from tools.engine_evidence import (
+    IDOT_KERNELS,
     PreambleError,
     parse_engine_banner,
     parse_engine_loaded,
@@ -58,12 +59,25 @@ class ParseEngineBannerTest(unittest.TestCase):
             parse_engine_banner("not a banner at all")
 
     def test_unknown_kernel_raises(self):
+        # Negative control for the roster test below: an unlisted kernel
+        # name (real ISA extension, not in IDOT_KERNELS) must be refused.
         with self.assertRaises(PreambleError):
             parse_engine_banner(_banner(**{"idot: avx2": "idot: sse4"}))
 
     def test_trailing_text_rejected(self):
         with self.assertRaises(PreambleError):
             parse_engine_banner(_BANNER + " extra")
+
+    def test_trailing_newline_rejected(self):
+        # fullmatch requires consuming the WHOLE string; $ is zero-width
+        # and matches just before a trailing "\n" too, so a weakening to
+        # .match() or .search() would let a newline-terminated banner
+        # through here even though fullmatch correctly refuses it. A
+        # caller doing `for line in f:` on real engine stdout hands over
+        # lines WITH their trailing newline, so this is the shape a real
+        # caller would actually feed in, not a synthetic corner case.
+        with self.assertRaises(PreambleError):
+            parse_engine_banner(_BANNER + "\n")
 
     # -- cap: [1, 2**31-1] --
 
@@ -132,6 +146,69 @@ class ParseEngineBannerTest(unittest.TestCase):
         fields = parse_engine_banner(_banner(**{"cache=8": "cache=7"}))
         self.assertEqual(fields["cap"], 7)
 
+    def test_oversized_field_raises_preamble_error_not_bare_value_error(self):
+        # _UINT_TEXT has no digit-count cap, so a field beyond Python's
+        # int-string conversion limit (sys.int_info.default_max_str_digits,
+        # 4300 by default) used to reach int()/float() raw, escaping as a
+        # bare ValueError instead of this module's own PreambleError --
+        # breaking every caller's contract to refuse with a named error.
+        huge = "1" + "0" * 4300
+        with self.assertRaises(PreambleError):
+            parse_engine_banner(_banner(**{"cache=8": f"cache={huge}"}))
+
+
+class IdotKernelRosterTest(unittest.TestCase):
+    """Pin every IDOT_KERNELS entry from the engine's own source, not just
+    avx2 (the only entry any test previously referenced -- confirmed by
+    RAN mutation: reducing IDOT_KERNELS to ("avx2",) alone left this
+    module's OWN 45-test suite fully green, since nothing here iterated
+    or symbolically referenced the roster). Removing any single entry
+    below, or the roster itself down to fewer entries, must fail this
+    test -- proof-of-bite for each is in the worker report.
+
+    Source of the 7 entries, cited by file:line: c/quant.h:582-594's
+    #if/#elif ladder defines IDOT_KERNEL to each of these string
+    literals in turn, and c/colibri.c:11243 prints it unmodified inside
+    the exact banner format this fixture reproduces character-for-
+    character (cache=%d experts/layer | compute experts@%d-bit
+    dense@%d-bit | idot: <IDOT_KERNEL>).
+
+      c/quant.h:582  "avx512-vnni"  (__AVX512VNNI__ && __AVX512BW__)
+      c/quant.h:584  "avx-vnni"     (__AVXVNNI__ && __AVX2__)
+      c/quant.h:586  "avx2"         (__AVX2__)
+      c/quant.h:588  "neon-i8mm"    (__ARM_NEON && __ARM_FEATURE_MATMUL_INT8)
+      c/quant.h:590  "neon"         (__ARM_NEON, no i8mm)               -- RAN
+      c/quant.h:592  "vsx"          (__VSX__)
+      c/quant.h:594  "scalar"       (else)
+
+    "neon" is marked RAN: this development host is arm64 Darwin, and
+    `echo | cc -dM -E -` (no -mcpu, matching this project's own Makefile
+    comment "ARCH unset -> no -mcpu, default build byte-identical")
+    defines __ARM_NEON but NOT __ARM_FEATURE_MATMUL_INT8 on this
+    machine, so its own default (unaccelerated) build takes the "neon"
+    branch of the ladder above -- confirmed by running that exact
+    compiler invocation, not by reading the source alone. This is a
+    compiler-preprocessor probe of the flags the default build actually
+    uses, not a captured engine stdout banner: no engine binary was
+    built or run for this (no model runs, per the dispatch's hard
+    bound). The other six entries are taken from the C source only
+    (INFERRED from c/quant.h's literals, not independently reproduced on
+    real hardware for each ISA).
+    """
+
+    def test_every_roster_entry_parses_from_real_banner_text(self):
+        for kernel in IDOT_KERNELS:
+            with self.subTest(kernel=kernel):
+                fields = parse_engine_banner(
+                    _banner(**{"idot: avx2": f"idot: {kernel}"}))
+                self.assertEqual(fields["kernel"], kernel)
+
+    def test_roster_is_not_accidentally_empty_or_singleton(self):
+        # A cheap sanity backstop for the roster itself, independent of
+        # any one entry's own test above.
+        self.assertEqual(len(IDOT_KERNELS), 7)
+        self.assertEqual(len(set(IDOT_KERNELS)), 7)
+
 
 class ParseEngineLoadedTest(unittest.TestCase):
     def test_exact_loaded_returns_typed_fields(self):
@@ -148,6 +225,13 @@ class ParseEngineLoadedTest(unittest.TestCase):
     def test_unrecognized_text_raises(self):
         with self.assertRaises(PreambleError):
             parse_engine_loaded("not a load record")
+
+    def test_trailing_newline_rejected(self):
+        # See ParseEngineBannerTest.test_trailing_newline_rejected: same
+        # fullmatch-vs-$ subtlety, same real-caller shape (stdout lines
+        # iterated with their newline still attached).
+        with self.assertRaises(PreambleError):
+            parse_engine_loaded(_LOADED + "\n")
 
     # -- layers: [1, 128] --
 
@@ -232,6 +316,13 @@ class ParseEngineLoadedTest(unittest.TestCase):
                "MTP DISABLED (multiplexed serve) (draft=0)"}))
         self.assertEqual(fields["mtp"], "DISABLED (multiplexed serve)")
         self.assertEqual(fields["draft"], 0)
+
+    def test_oversized_field_raises_preamble_error_not_bare_value_error(self):
+        # See ParseEngineBannerTest's identical test: same digit-count
+        # cap gap, same fix, this function's own layers field.
+        huge = "1" + "0" * 4300
+        with self.assertRaises(PreambleError):
+            parse_engine_loaded(_loaded(**{"layers=32": f"layers={huge}"}))
 
 
 class ParseEnginePreambleTest(unittest.TestCase):

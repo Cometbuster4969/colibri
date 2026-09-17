@@ -323,29 +323,26 @@ class EvalGlmEvidenceTests(unittest.TestCase):
         # tree ever prints a line starting with "loaded index" -- the only
         # stdout "loaded" record any engine emits is the exact "loaded in
         # ...s | resident dense: ..." line this module already pins above.
-        # This test documents eval_glm's actual, current behavior for that
-        # coincidental prefix collision (refused, not silently passed
-        # through) rather than asserting it is the last word on the
-        # question -- see the worker report's F2 section for why the
-        # underlying docstring in the shared engine_evidence.py is not
-        # touched here.
+        # This is deliberately fail-loud dispatch behavior, not a bug --
+        # see engine_evidence.parse_engine_preamble's own docstring
+        # (fixed in this cycle to document the prefix mechanism and this
+        # exact collision explicitly, since no engine anywhere in this
+        # tree emits "loaded index" today). This test pins eval_glm's
+        # own consumer-visible behavior for the same collision.
         with self.assertRaises(EVAL.EvidenceError):
             EVAL.classify_score_stdout("loaded index 5 whatever\n")
 
     def test_oversized_numeric_field_refuses_as_evidence_error(self):
-        # engine_evidence's int()/float() calls on a preamble field raise
-        # Python's own bare ValueError (not its PreambleError) once a
-        # numeric field exceeds the interpreter's 4300-digit int-string
-        # conversion limit (sys.int_info.default_max_str_digits) -- the
-        # regex that captures the field has no digit-count cap of its
-        # own. Before this module's three call sites caught ValueError
-        # alongside PreambleError, that bare ValueError escaped
-        # classify_score_stdout, ScoreStdoutClassifier.classify, and
-        # is_score_preamble uncaught, breaking this module's own
-        # contract to refuse every non-canonical record with a named
-        # error rather than crash. This module's own error contract is
-        # fixed here; the underlying engine_evidence.py, shared
-        # verbatim with other in-flight branches, is unchanged.
+        # engine_evidence's own int()/float() calls now catch this at
+        # the root (a numeric preamble field beyond the interpreter's
+        # 4300-digit int-string conversion limit raises engine_evidence's
+        # own PreambleError, not a bare ValueError) -- see
+        # test_engine_evidence.py's identical-purpose tests on
+        # parse_engine_banner/parse_engine_loaded directly. This
+        # module's three call sites still catch ValueError alongside
+        # PreambleError too, as defense in depth for any other
+        # ValueError the shared module might someday raise; this test
+        # pins the end-to-end result through eval_glm's own consumers.
         big = "1" + "0" * 4300
         banner = (
             f"== GLM C engine (glm_moe_dsa), cache={big} experts/layer | "
