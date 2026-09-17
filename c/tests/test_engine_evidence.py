@@ -194,6 +194,20 @@ class IdotKernelRosterTest(unittest.TestCase):
     bound). The other six entries are taken from the C source only
     (INFERRED from c/quant.h's literals, not independently reproduced on
     real hardware for each ISA).
+
+    VACUOUS-GATE NOTE: test_every_roster_entry_parses_from_real_banner_text
+    below iterates IDOT_KERNELS and checks each entry parses to itself --
+    but _BANNER_RE is ITSELF built from IDOT_KERNELS
+    ("|".join(IDOT_KERNELS)), so a renamed entry (same count, different
+    spelling) produces a banner the correspondingly-mutated regex still
+    matches: the assertion compares the mutation against itself and can
+    pass having checked nothing about the entry's real spelling. Only
+    test_roster_matches_frozen_expectation below, which compares against
+    an independent literal transcribed from c/quant.h rather than against
+    IDOT_KERNELS itself, actually defends the CONTENT of each entry; the
+    per-entry parse loop is kept because it still defends something real
+    (that parse_engine_banner's kernel-dispatch group and IDOT_KERNELS
+    stay in sync with each other), just not entry spelling on its own.
     """
 
     def test_every_roster_entry_parses_from_real_banner_text(self):
@@ -203,9 +217,25 @@ class IdotKernelRosterTest(unittest.TestCase):
                     _banner(**{"idot: avx2": f"idot: {kernel}"}))
                 self.assertEqual(fields["kernel"], kernel)
 
+    def test_roster_matches_frozen_expectation(self):
+        # Frozen from c/quant.h:582-594's #if/#elif ladder. If the
+        # engine's ladder changes, this literal and the roster both
+        # change, deliberately and together. Unlike the per-entry parse
+        # loop above, this does NOT derive its expectation from
+        # IDOT_KERNELS or from _BANNER_RE (which is itself built from
+        # IDOT_KERNELS) -- it is the independent source transcription
+        # that makes a same-length rename of any entry (which the parse
+        # loop and the count/uniqueness check below both miss) fail.
+        EXPECTED_IDOT_KERNELS = ("avx512-vnni", "avx-vnni", "avx2",
+                                 "neon-i8mm", "neon", "vsx", "scalar")
+        self.assertEqual(IDOT_KERNELS, EXPECTED_IDOT_KERNELS)
+
     def test_roster_is_not_accidentally_empty_or_singleton(self):
         # A cheap sanity backstop for the roster itself, independent of
-        # any one entry's own test above.
+        # any one entry's own test above. Redundant with the frozen-
+        # literal test for a length change, but kept because it is a
+        # different, cheaper check that would survive even if the
+        # literal above ever needed updating for a real ladder change.
         self.assertEqual(len(IDOT_KERNELS), 7)
         self.assertEqual(len(set(IDOT_KERNELS)), 7)
 
