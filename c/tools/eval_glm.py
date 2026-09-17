@@ -118,7 +118,11 @@ def is_score_preamble(line):
     """Validate one of the two exact stdout records emitted before SCORE."""
     try:
         return parse_engine_preamble(line) is not None
-    except PreambleError:
+    except (PreambleError, ValueError):
+        # engine_evidence's own int() conversions can raise a bare
+        # ValueError (not its PreambleError) for a numeric field beyond
+        # Python's 4300-digit int-string conversion limit; a query
+        # function is not the place to let that escape uncaught.
         return False
 
 
@@ -151,7 +155,12 @@ def classify_score_stdout(raw_line):
         raise EvidenceError("blank SCORE stdout record")
     try:
         preamble = parse_engine_preamble(line)
-    except PreambleError as exc:
+    except (PreambleError, ValueError) as exc:
+        # See ScoreStdoutClassifier.classify's identical clause: a
+        # numeric preamble field beyond Python's int-string conversion
+        # limit raises a bare ValueError from engine_evidence, not its
+        # own PreambleError -- refuse it with a named error here too
+        # rather than let it escape uncaught.
         raise EvidenceError(str(exc)) from exc
     if preamble is not None:
         return None
@@ -191,7 +200,13 @@ class ScoreStdoutClassifier:
                 self._state = 2
                 return None
             preamble = parse_engine_preamble(line)
-        except PreambleError as exc:
+        except (PreambleError, ValueError) as exc:
+            # A numeric preamble field beyond Python's 4300-digit
+            # int-string conversion limit raises a bare ValueError from
+            # engine_evidence's own int()/float() calls, not its
+            # PreambleError -- this module's contract is to refuse every
+            # non-canonical record with a named error, never to let one
+            # escape uncaught.
             raise EvidenceError(str(exc)) from exc
         if preamble is not None:
             raise EvidenceError(f"duplicate/out-of-order SCORE preamble: {line!r}")

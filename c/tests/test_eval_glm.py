@@ -149,6 +149,76 @@ class EvalGlmEvidenceTests(unittest.TestCase):
         self.assertEqual(value, -8.553458)
         self.assertEqual((contlen, greedy), (4096, 1))
 
+    def test_parse_c17g_rejects_trailing_garbage(self):
+        # parse_c17g is only ever reached, elsewhere in this module,
+        # through _SCORE_RE's own "^...$"-anchored capture group, which
+        # already excludes trailing garbage before parse_c17g ever sees
+        # the text -- so nothing else in this module's test suite drives
+        # parse_c17g directly. Direct coverage: verified (RAN, against a
+        # scratch mutant copy, not committed) that weakening the
+        # fullmatch to match here is actually an EQUIVALENT mutant for
+        # every input tried -- the round-trip format comparison a few
+        # lines below the match call independently rejects any text with
+        # a non-canonical tail, since format(value, ...) can never
+        # reproduce trailing garbage. This test pins parse_c17g's own
+        # contract directly rather than only through callers; it does
+        # not by itself prove the fullmatch call is load-bearing.
+        with self.assertRaises(EVAL.EvidenceError):
+            EVAL.parse_c17g("1.5garbage")
+        with self.assertRaises(EVAL.EvidenceError):
+            EVAL.parse_c17g("-8.553458 ")  # trailing space after a valid token
+        self.assertEqual(EVAL.parse_c17g("1.5"), 1.5)
+
+    def test_parse_c17g_rejects_bare_trailing_decimal_point(self):
+        # "1." is valid Python float() syntax (float("1.") == 1.0), so
+        # only the round-trip format comparison -- not the decimal
+        # group's "one-or-more" digit requirement -- is what actually
+        # rejects it: format(1.0, ".17g") == "1", never "1.". Verified
+        # (RAN, scratch mutant, not committed) that widening that group
+        # to "zero-or-more" does not change parse_c17g's accept/reject
+        # outcome for any of these inputs; kept as direct-coverage
+        # regression pins, not as proof the digit requirement is
+        # independently load-bearing.
+        for bad in ("1.", "-0.", "12."):
+            with self.subTest(bad=bad):
+                with self.assertRaises(EVAL.EvidenceError):
+                    EVAL.parse_c17g(bad)
+
+    def test_parse_c17g_rejects_single_digit_exponent(self):
+        # C's %e/%g exponent is zero-padded to at least two digits
+        # ("e-05", never "e-5"). Verified (RAN, scratch mutant, not
+        # committed) that widening the exponent's trailing-digit count
+        # from {1,2} to {0,2} does NOT change parse_c17g's outcome here
+        # either, for the same reason as the two tests above: no
+        # canonical %.6f/%.17g spelling ever produces a single-digit
+        # exponent, so the round-trip check rejects it independently of
+        # this group's width. Use a magnitude small enough that %.17g
+        # actually chooses exponential notation (a mid-size value like
+        # 1e5 round-trips through plain "100000" instead and would not
+        # even reach the exponent group).
+        text = format(-1.0000000000000001e-05, ".17g")
+        self.assertEqual(text, "-1.0000000000000001e-05")
+        self.assertEqual(EVAL.parse_c17g(text), -1.0000000000000001e-05)
+        with self.assertRaises(EVAL.EvidenceError):
+            EVAL.parse_c17g(text.replace("e-05", "e-5"))
+
+    def test_parse_engine_loaded_rejects_overflowing_metrics(self):
+        # load_s/resident_mb have no magnitude cap in _FIXED2_TEXT (only
+        # a fixed 2-decimal-digit suffix), so a long enough digit run
+        # converts via float() to +inf; unlike parse_c17g there is no
+        # round-trip format comparison to catch that independently here,
+        # so the isfinite check is this function's only defense against
+        # it -- a removed/weakened isfinite check would silently accept
+        # an infinite load time or resident size.
+        huge = "1" + "0" * 350 + ".00"
+        for field in ("load_s", "resident_mb"):
+            with self.subTest(field=field):
+                kwargs = {"load": huge} if field == "load_s" else {"resident": huge}
+                line = self.loaded(**kwargs)
+                with self.assertRaisesRegex(
+                        EVAL.PreambleError, "must be finite"):
+                    EVAL.parse_engine_loaded(line)
+
     def test_score_request_digest_binds_strict_ascii_bytes_including_lf(self):
         requests = ("1 1 1 2", "2 1 0 1 2")
         lines, payload, digests = EVAL.score_request_wire(requests, 3)
@@ -241,6 +311,54 @@ class EvalGlmEvidenceTests(unittest.TestCase):
             with self.subTest(line=line):
                 with self.assertRaises(EVAL.EvidenceError):
                     EVAL.classify_score_stdout(line)
+
+    def test_loaded_prefix_collision_is_refused_not_passed_through(self):
+        # engine_evidence.parse_engine_preamble dispatches by literal prefix
+        # (line.startswith("loaded in")), not by a semantic match against
+        # the load record's shape. "loaded index ..." shares that 9-char
+        # prefix purely because "index" itself starts with "in", so it is
+        # routed into parse_engine_loaded and refused there, rather than
+        # returned as an ordinary unowned log line. Confirmed at primary
+        # source (c/colibri.c on origin/dev): no engine anywhere in this
+        # tree ever prints a line starting with "loaded index" -- the only
+        # stdout "loaded" record any engine emits is the exact "loaded in
+        # ...s | resident dense: ..." line this module already pins above.
+        # This test documents eval_glm's actual, current behavior for that
+        # coincidental prefix collision (refused, not silently passed
+        # through) rather than asserting it is the last word on the
+        # question -- see the worker report's F2 section for why the
+        # underlying docstring in the shared engine_evidence.py is not
+        # touched here.
+        with self.assertRaises(EVAL.EvidenceError):
+            EVAL.classify_score_stdout("loaded index 5 whatever\n")
+
+    def test_oversized_numeric_field_refuses_as_evidence_error(self):
+        # engine_evidence's int()/float() calls on a preamble field raise
+        # Python's own bare ValueError (not its PreambleError) once a
+        # numeric field exceeds the interpreter's 4300-digit int-string
+        # conversion limit (sys.int_info.default_max_str_digits) -- the
+        # regex that captures the field has no digit-count cap of its
+        # own. Before this module's three call sites caught ValueError
+        # alongside PreambleError, that bare ValueError escaped
+        # classify_score_stdout, ScoreStdoutClassifier.classify, and
+        # is_score_preamble uncaught, breaking this module's own
+        # contract to refuse every non-canonical record with a named
+        # error rather than crash. This module's own error contract is
+        # fixed here; the underlying engine_evidence.py, shared
+        # verbatim with other in-flight branches, is unchanged.
+        big = "1" + "0" * 4300
+        banner = (
+            f"== GLM C engine (glm_moe_dsa), cache={big} experts/layer | "
+            "compute experts@4-bit dense@8-bit | idot: avx2 ==\n")
+        with self.assertRaises(EVAL.EvidenceError):
+            EVAL.classify_score_stdout(banner)
+        parser = EVAL.ScoreStdoutClassifier()
+        with self.assertRaises(EVAL.EvidenceError):
+            parser.classify(banner)
+        # is_score_preamble is a query function (bool return); it must
+        # swallow the malformed-field case as "not a preamble" rather
+        # than raise at all.
+        self.assertFalse(EVAL.is_score_preamble(banner.rstrip("\n")))
 
     def test_banner_kernels_and_load_boundaries_are_exact(self):
         self.assertEqual(
