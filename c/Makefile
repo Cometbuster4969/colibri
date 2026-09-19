@@ -472,9 +472,10 @@ TEST_RULES  := $(shell sed -n 's|^tests/\(test_[a-z0-9_]*\)\$$(EXE):.*|\1|p' $(f
 # test_uring is Linux-only. V4 engine tests are appended below only on supported
 # x86-64 Linux/Windows and aarch64 Linux hosts; the V4 infrastructure tests have
 # unconditional rules and therefore remain portable gates. test_gsgemv_sse41/
-# test_qgemv_sse41 force -msse4.1/-mno-avx2/-mno-fma, which only exist as gcc/
-# clang flags on x86 -- unconditionally in TEST_BINS they take down `check` on
-# arm64 (e.g. macOS): "unsupported option '-msse4.1' for target arm64-...".
+# test_qgemv_sse41/test_olmoe_dot_i8_16_sse41 force -msse4.1/-mno-avx2/-mno-fma,
+# which only exist as gcc/clang flags on x86 -- unconditionally in TEST_BINS
+# they take down `check` on arm64 (e.g. macOS):
+# "unsupported option '-msse4.1' for target arm64-...".
 # Appended back below only on x86-64 hosts, alongside the other conditional
 # platform tests already handled the same way.
 # test_qwen38_tier_engine drives qwen38.c over the generated FP8 fixture
@@ -482,13 +483,13 @@ TEST_RULES  := $(shell sed -n 's|^tests/\(test_[a-z0-9_]*\)\$$(EXE):.*|\1|p' $(f
 TEST_EXCLUDE = test_uring test_deepseek_v4 test_v4_ownership test_v4_serve_framing \
 	test_segment_adapters_registration test_segment_adapters_real \
 	test_edge_adapters_registration test_edge_adapters_real \
-	test_gsgemv_sse41 test_qgemv_sse41 test_qwen38_tier_engine
+	test_gsgemv_sse41 test_qgemv_sse41 test_olmoe_dot_i8_16_sse41 test_qwen38_tier_engine
 TEST_BINS    = $(addprefix tests/,$(addsuffix $(EXE),$(filter-out $(TEST_EXCLUDE),$(TEST_RULES))))
 ifneq (,$(LINUX))
 TEST_BINS += tests/test_uring$(EXE)
 endif
 ifneq (,$(X86_64))
-TEST_BINS += tests/test_gsgemv_sse41$(EXE) tests/test_qgemv_sse41$(EXE)
+TEST_BINS += tests/test_gsgemv_sse41$(EXE) tests/test_qgemv_sse41$(EXE) tests/test_olmoe_dot_i8_16_sse41$(EXE)
 endif
 ifeq ($(COLI_V4_SUPPORTED),1)
 TEST_BINS += tests/test_v4_hybrid_policy$(EXE) tests/test_k3_fill_budget$(EXE) tests/test_v4_bank_pair$(EXE)
