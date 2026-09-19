@@ -1151,10 +1151,6 @@ FAMILIES = (
         planner_geometry=_glm_geometry,
         planner_unsupported_reason="",
         expert_inventory=_individual_expert_inventory(_GLM_EXPERT),
-        # coli convert routes to convert_olmoe_merged.py (d4d11ef dispatch);
-        # the converter takes no precision flags (--ebits / --group-size etc.).
-        converter="convert_olmoe_merged.py",
-        converter_accepts=(),
         config_section="root",
         limits=FamilyLimits(4096, 1048576, 1024, 16384, 16, 0, "CTX"),
         capabilities=FamilyCapabilities(True, True, False, True),
@@ -1252,6 +1248,10 @@ FAMILIES = (
         # links NOCUDA_LDFLAGS. Left at the default this advertised a VRAM tier.
         supports_accelerator=False,
         expert_inventory=_individual_expert_inventory(_GLM_EXPERT),
+        # coli convert routes to convert_olmoe_merged.py (d4d11ef dispatch);
+        # the converter takes no precision flags (--ebits / --group-size etc.).
+        converter="convert_olmoe_merged.py",
+        converter_accepts=(),
         config_section="root",
         # implicit_cap 0, not 8: the engine sizes its expert cache from the RAM
         # budget once the dense weights are resident (#1443), so "nobody chose a
