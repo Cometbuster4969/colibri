@@ -36,9 +36,15 @@ $ ./coli chat
 <p align="center">
   <img src="docs/media/colibri-dashboard.png" width="900" alt="colibrì 网页仪表盘——实时指标、硬件面板与专家存储层级">
 </p>
-<p align="center"><em>网页仪表盘（<code>./coli web</code>）：744B 模型达到 <strong>4 tok/s、TTFT 1.6 秒、磁盘读取 0</strong>——
-在 6× RTX 5090 上让所有专家常驻，并实时显示 token 指标、每轮耗时明细、
-VRAM／RAM／磁盘层级条，以及角落的实时迷你大脑。</em></p>
+<p align="center"><em>网页仪表盘（<code>./coli web</code>），1.12.0 重新设计：一个工作区，底部停靠栏切换聊天、Brio 模式、
+Brain 页面和性能分析，支持浅色与深色主题。图中是 Qwen3.6 在纯 CPU 机器上作答，专家从磁盘流式读取。</em></p>
+
+<p align="center">
+  <img src="docs/media/colibri-brio.png" width="900" alt="Brio 页面：文档只读一次，每个允许的答案各有一个概率，并给出熵">
+</p>
+<p align="center"><em><strong>Brio 模式</strong>：同一个模型，只是不再让它写。给它一段文档和唯一允许的几个答案，
+它读出每个答案的概率，不生成任何 token，并给出一个熵，说明它何时没有把握。图中：<strong>request changes，99.9%</strong>，
+熵 0.005，读取 4 个 token，生成 0 个。</em></p>
 
 <p align="center">
   <img src="docs/media/colibri-brain.png" width="900" alt="大脑页面——以实时皮层呈现 19,456 个专家">
@@ -273,6 +279,33 @@ COLI_MODEL=/nvme/glm52_i4 ./coli doctor   # 只读就绪检查
 ./coli serve --model /nvme/glm52_i4       # 仅提供 OpenAI 兼容 API
 ```
 
+#### Brio 模式：问一个封闭式问题
+
+人们向模型提出的大多数请求是一次选择，而不是一段文字：哪个队列、哪个结论、某个字段应取四个值中的哪一个。
+Brio 模式把允许的选项交给引擎，读出每个选项的概率，而不是生成文本：`completion_tokens` 为 0，
+答案不可能落在你的列表之外，并且每个答案都附带一个熵，"模型没有把握"因此成为一个可以设阈值的数字。
+它在全部九个模型家族上可用，运行在同一个服务器上，且按请求可选：不请求它的聊天，输出逐字节保持不变。
+
+```bash
+# 在 TUI 中：同一个模型，只是不再让它写
+./coli chat --model /nvme/qwen36_i4_gs64
+> /brio merge | request changes | close
+> 340 lines, 8 files, no tests. CI is green but nothing covers that path.
+
+# 从任何程序：向运行中的服务器发送一个 JSON 请求
+curl -s http://127.0.0.1:8000/v1/brio -H 'Content-Type: application/json' -d '{
+  "model": "qwen36",
+  "state": "340 lines, 8 files, no tests. CI is green but nothing covers that path.",
+  "question": "What should the reviewer do?",
+  "options": ["merge", "request changes", "close"]}'
+```
+
+`questions` 可以对只读一次的文档提出多个问题；`schema` 逐字段填充一个 JSON 对象，结构上必然合法。
+在 Qwen3.6 上与在同一台 CPU 机器上生成同样答案相比的实测：四字段 schema 快 2.4 倍，
+对同一文档的四个问题快 5.7 倍。完整说明、请求与回复格式、以及它不适用的情形见 [docs/brio.md](docs/brio.md)。
+仪表盘中也有 Brio 页面。
+
+
 在 Windows 上同样使用这些命令，写作 `python coli chat --model D:\glm52_i4`。
 引擎运行时是纯 C——python 只供一次性转换工具与可选的 API gateway 使用。
 
@@ -286,6 +319,7 @@ COLI_MODEL=/nvme/glm52_i4 ./coli doctor   # 只读就绪检查
 | CUDA 后端、VRAM 专家层级、全部常驻 | [docs/cuda.md](docs/cuda.md) |
 | Apple Silicon Metal 后端 | [docs/metal.md](docs/metal.md) |
 | OpenAI 兼容 API、KV slots、网页仪表盘 | [docs/api.md](docs/api.md) |
+| Brio 模式：对封闭的选项集打分而不是生成 | [docs/brio.md](docs/brio.md) |
 | 语法强制草稿（结构化输出） | [docs/grammar-draft.md](docs/grammar-draft.md) |
 | 环境变量完整清单 | [docs/ENVIRONMENT.md](docs/ENVIRONMENT.md) |
 

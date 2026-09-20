@@ -51,9 +51,16 @@ $ ./coli chat
 <p align="center">
   <img src="docs/media/colibri-dashboard.png" width="900" alt="colibrì web dashboard — live metrics, hardware panel, expert tiers">
 </p>
-<p align="center"><em>The web dashboard (<code>./coli web</code>): a 744B model at <strong>4 tok/s, TTFT 1.6 s, disk 0</strong> —
-full expert residency on 6× RTX 5090, with live token metrics, the per-turn time breakdown,
-the VRAM/RAM/disk tier bar and the live mini-brain in the corner.</em></p>
+<p align="center"><em>The web dashboard (<code>./coli web</code>), redesigned in 1.12.0: a workspace with a dock for the chat,
+Brio mode, the Brain page and Profiling, in a light or a dark theme. Here Qwen3.6 answering on a CPU box,
+experts streamed from disk.</em></p>
+
+<p align="center">
+  <img src="docs/media/colibri-brio.png" width="900" alt="the Brio page: a document read once, a probability for every allowed answer, and an entropy">
+</p>
+<p align="center"><em><strong>Brio mode</strong>: the same model, told to stop writing. Give it a document and the only answers
+it may pick; it reads the probability of each one, generates nothing, and reports an entropy that says when it is
+not sure. Here: <strong>request changes at 99.9%</strong>, entropy 0.005, 4 tokens read, 0 generated.</em></p>
 
 <p align="center">
   <img src="docs/media/colibri-brain.png" width="900" alt="the Brain page — 19,456 experts as a live cortex">
@@ -473,6 +480,39 @@ COLI_MODEL=/nvme/glm52_i4 ./coli tune     # measure and save this machine's fast
 ./coli serve --model /nvme/glm52_i4       # API + dashboard, no browser (headless)
 ```
 
+#### Brio mode: ask a closed question
+
+Most of what people ask a model for is a choice, not a paragraph: which queue,
+which verdict, which of the four values a field may take. Brio mode hands the
+engine the options and reads the probability of each one instead of
+generating: `completion_tokens` is 0, no answer can fall outside your list,
+and every answer comes with an entropy, so "the model is not sure" is a
+number you can put a threshold on. It runs on all nine families, on the same
+server, and it is opt-in per request: chat is byte-identical for everyone who
+does not ask for it.
+
+```bash
+# in the TUI: the same model, told to stop writing
+./coli chat --model /nvme/qwen36_i4_gs64
+> /brio merge | request changes | close
+> 340 lines, 8 files, no tests. CI is green but nothing covers that path.
+
+# from anywhere: one JSON request on the running server
+curl -s http://127.0.0.1:8000/v1/brio -H 'Content-Type: application/json' -d '{
+  "model": "qwen36",
+  "state": "340 lines, 8 files, no tests. CI is green but nothing covers that path.",
+  "question": "What should the reviewer do?",
+  "options": ["merge", "request changes", "close"]}'
+```
+
+`questions` asks many things about one document read once, and `schema` fills
+a JSON object one field at a time, valid by construction. Measured on Qwen3.6
+against generating the same answer on the same CPU box: 2.4x on a four-field
+schema, 5.7x on four questions about one document. The whole mode, the
+request and reply shapes, and where it does not help: [docs/brio.md](docs/brio.md).
+The dashboard has a Brio page as well.
+
+
 On Windows a release archive ships `coli.cmd`: double-click it for the quick
 start, or run `coli.cmd chat --model D:\glm52_i4` from cmd or PowerShell.
 From a source checkout the same commands work with `python coli chat --model
@@ -528,6 +568,7 @@ Two things that differ per model, both documented in the per-model page:
 | Vulkan backend (any GPU: AMD via RADV, incl. cards ROCm dropped) | [docs/vulkan.md](docs/vulkan.md) |
 | Apple Silicon Metal backend | [docs/metal.md](docs/metal.md) |
 | OpenAI-compatible API, KV slots, web dashboard | [docs/api.md](docs/api.md) |
+| Brio mode: score a closed set of options instead of generating | [docs/brio.md](docs/brio.md) |
 | Experimental layer-segment embedding ABI | [docs/segment-runtime.md](docs/segment-runtime.md) |
 | Experimental tokenizer/embedding/head Edge ABI | [docs/edge-runtime.md](docs/edge-runtime.md) |
 | Grammar-forced drafts (structured output) | [docs/grammar-draft.md](docs/grammar-draft.md) |

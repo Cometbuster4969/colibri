@@ -45,9 +45,16 @@ $ ./coli chat
 <p align="center">
   <img src="docs/media/colibri-dashboard.png" width="900" alt="dashboard web di colibrì — metriche live, pannello hardware, livelli degli expert">
 </p>
-<p align="center"><em>La dashboard web (<code>./coli web</code>): un modello da 744B a <strong>4 tok/s, TTFT 1.6 s, disco 0</strong> —
-residenza completa degli expert su 6× RTX 5090, con metriche token in tempo reale, breakdown dei tempi per turno,
-la barra dei livelli VRAM/RAM/disco e il mini-cervello live nell'angolo.</em></p>
+<p align="center"><em>La dashboard web (<code>./coli web</code>), ridisegnata nella 1.12.0: uno spazio di lavoro con un dock per la chat,
+la modalità Brio, la pagina Brain e il Profiling, in tema chiaro o scuro. Qui Qwen3.6 che risponde su una macchina
+solo CPU, con gli expert letti dal disco.</em></p>
+
+<p align="center">
+  <img src="docs/media/colibri-brio.png" width="900" alt="la pagina Brio: un documento letto una volta, una probabilità per ogni risposta ammessa, e un'entropia">
+</p>
+<p align="center"><em><strong>Modalità Brio</strong>: lo stesso modello, a cui si dice di non scrivere. Gli dai un documento e le sole risposte
+che può scegliere; legge la probabilità di ciascuna, non genera niente, e riporta un'entropia che dice quando non è
+sicuro. Qui: <strong>request changes al 99.9%</strong>, entropia 0.005, 4 token letti, 0 generati.</em></p>
 
 <p align="center">
   <img src="docs/media/colibri-brain.png" width="900" alt="la pagina Brain — 19.456 expert come una corteccia vivente">
@@ -317,6 +324,39 @@ COLI_MODEL=/nvme/glm52_i4 ./coli doctor   # controllo di idoneità (sola lettura
 ./coli serve --model /nvme/glm52_i4       # solo API compatibile OpenAI
 ```
 
+#### Modalità Brio: una domanda a risposta chiusa
+
+Gran parte di ciò che si chiede a un modello è una scelta, non un paragrafo:
+quale coda, quale verdetto, quale dei quattro valori può prendere un campo. La
+modalità Brio passa al motore le opzioni e legge la probabilità di ciascuna
+invece di generare: `completion_tokens` è 0, nessuna risposta può uscire dalla
+tua lista, e ogni risposta arriva con un'entropia, così "il modello non è
+sicuro" è un numero su cui mettere una soglia. Funziona su tutte e nove le
+famiglie, sullo stesso server, ed è opzionale per richiesta: la chat resta
+identica byte per byte per chi non la chiede.
+
+```bash
+# nella TUI: lo stesso modello, a cui si dice di non scrivere
+./coli chat --model /nvme/qwen36_i4_gs64
+> /brio merge | request changes | close
+> 340 lines, 8 files, no tests. CI is green but nothing covers that path.
+
+# da qualunque programma: una richiesta JSON al server in esecuzione
+curl -s http://127.0.0.1:8000/v1/brio -H 'Content-Type: application/json' -d '{
+  "model": "qwen36",
+  "state": "340 lines, 8 files, no tests. CI is green but nothing covers that path.",
+  "question": "What should the reviewer do?",
+  "options": ["merge", "request changes", "close"]}'
+```
+
+`questions` fa molte domande su un documento letto una volta sola, e `schema`
+riempie un oggetto JSON un campo alla volta, valido per costruzione. Misurato
+su Qwen3.6 contro la generazione della stessa risposta sulla stessa macchina
+CPU: 2,4x su uno schema a quattro campi, 5,7x su quattro domande sullo stesso
+documento. Tutta la modalità, la forma di richiesta e risposta, e dove non
+serve: [docs/brio.md](docs/brio.md). Anche la dashboard ha una pagina Brio.
+
+
 Su Windows gli stessi comandi funzionano con `python coli chat --model D:\glm52_i4`.
 Il motore a runtime è puro C — python si usa solo per il convertitore (una tantum)
 e per il gateway API opzionale.
@@ -331,6 +371,7 @@ e per il gateway API opzionale.
 | Backend CUDA, livello expert in VRAM, residenza completa | [docs/cuda.md](docs/cuda.md) |
 | Backend Metal per Apple Silicon | [docs/metal.md](docs/metal.md) |
 | API compatibile OpenAI, KV slot, dashboard web | [docs/api.md](docs/api.md) |
+| Modalità Brio: punteggiare un insieme chiuso di opzioni invece di generare | [docs/brio.md](docs/brio.md) |
 | Draft forzati da grammatica (output strutturato) | [docs/grammar-draft.md](docs/grammar-draft.md) |
 | Inventario delle variabili d'ambiente | [docs/ENVIRONMENT.md](docs/ENVIRONMENT.md) |
 
