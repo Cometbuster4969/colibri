@@ -363,6 +363,16 @@ class TemplateTest(unittest.TestCase):
             generation_options({"response_format": {"type": "yaml"}}, 8)
         with self.assertRaises(APIError):
             generation_options({"response_format": {"type": "json_schema", "json_schema": {}}}, 8)
+        # a json_schema that is not an object is the client's mistake too: a 400
+        # naming the parameter, not an AttributeError the handler turns into a
+        # 500 "engine failed" (which OpenAI SDKs retry)
+        for json_schema in ('{"schema": {}}', [schema], 5, True):
+            with self.subTest(json_schema=json_schema):
+                with self.assertRaises(APIError) as caught:
+                    generation_options({"response_format": {"type": "json_schema",
+                                                            "json_schema": json_schema}}, 8)
+                self.assertEqual(caught.exception.status, 400)
+                self.assertEqual(caught.exception.param, "response_format")
         with self.assertRaises(APIError):   # non-dict response_format
             generation_options({"response_format": "json"}, 8)
         with self.assertRaises(APIError):   # empty gbnf
@@ -373,6 +383,39 @@ class TemplateTest(unittest.TestCase):
         # (draft source only — bad grammar costs the speedup, never the request)
         opts = generation_options({"response_format": {"type": "gbnf", "grammar": "not a grammar ::="}}, 8)
         self.assertEqual(opts[3], "not a grammar ::=")
+
+    def test_tool_choice_function_that_is_not_an_object_is_a_400(self):
+        """The same read, six places: generation_options and five renderers.
+
+        `(tool_choice.get("function") or {}).get("name")` raised AttributeError
+        on {"type": "function", "function": "search"} -- the name written where
+        the object goes -- and that became a 500 "engine failed" instead of the
+        400 generation_options already had two lines further down. The renderers
+        crashed on the identical expression before validation was even reached.
+        """
+        import openai_server as srv
+        tools = [{"type": "function", "function": {"name": "search"}}]
+        messages = [{"role": "user", "content": "hi"}]
+        for function in ("search", ["search"], 5, True):
+            with self.subTest(function=function):
+                choice = {"type": "function", "function": function}
+                with self.assertRaises(APIError) as caught:
+                    generation_options({"tools": tools, "tool_choice": choice}, 8)
+                self.assertEqual(caught.exception.status, 400)
+                self.assertEqual(caught.exception.param, "tool_choice")
+                # the renderers must get past the read so that 400 is what runs
+                for render in (render_chat, srv.render_chat_glm53, render_chat_kimi,
+                               render_chat_v4, srv.render_chat_dsv41):
+                    render(list(messages), tools=list(tools), tool_choice=choice)
+        # A well-formed choice, and the legacy {"type": "function", "name": ...}
+        # spelling, still force the tool.
+        for choice in ({"type": "function", "function": {"name": "search"}},
+                       {"type": "function", "name": "search"}):
+            with self.subTest(choice=choice):
+                generation_options({"tools": tools, "tool_choice": choice}, 8)
+                self.assertIn("You must call the function `search`",
+                              render_chat(list(messages), tools=list(tools),
+                                          tool_choice=choice))
 
     def test_coli_temp_is_the_default_for_requests_that_omit_temperature(self):
         with patch.dict("openai_server.os.environ", {"COLI_TEMP": "0.25"}):
@@ -1505,6 +1548,84 @@ class HTTPTest(unittest.TestCase):
         self.addCleanup(caught.exception.close)
         self.assertEqual(caught.exception.code, 400)
 
+    def test_unpaired_surrogate_is_a_client_error(self):
+        """JSON can spell a lone UTF-16 surrogate ("\\ud83d": a client that cut a
+        string between the two halves of an emoji). json.loads accepts it, no
+        UTF-8 can carry it, and Engine.generate's first step, prompt.encode(),
+        raised: HTTP 500 "The colibri engine failed". Invalid UTF-8 in the raw
+        body is already a 400; this is the same invalid text, escaped."""
+        real_generate = self.engine.generate
+
+        def encoding_generate(prompt, *args, **kwargs):
+            prompt.encode("utf-8")          # what Engine.generate does before anything else
+            return real_generate(prompt, *args, **kwargs)
+
+        cut = "emoji \ud83d"
+        cases = (("/v1/chat/completions", {"messages": [{"role": "user", "content": cut}]}),
+                 ("/v1/completions", {"prompt": cut}),
+                 ("/v1/messages", {"max_tokens": 4, "messages": [{"role": "user", "content": cut}]}))
+        with patch.object(self.engine, "generate", side_effect=encoding_generate):
+            for path, body in cases:
+                with self.subTest(path=path):
+                    with self.assertRaises(HTTPError) as caught:
+                        self.request(path, dict(body, model="test-model"))
+                    self.addCleanup(caught.exception.close)
+                    self.assertEqual(caught.exception.code, 400)
+
+    def test_tool_choice_with_a_non_object_function_is_a_client_error(self):
+        """{"type": "function", "function": "search"} answered HTTP 500.
+
+        generation_options() already has the 400 for a `tool_choice` function
+        object with no name, but it -- and the five renderers that read the
+        forced tool the same way -- did `(tool_choice.get("function") or {})
+        .get("name")`, so a `function` that is not an object raised
+        AttributeError first and do_POST answered 500 "The colibri engine failed
+        to process the request." for a request the engine never saw. Every arch
+        and both OpenAI endpoints, because the crash was on the read.
+        """
+        tools = [{"type": "function", "function": {"name": "search"}}]
+        for arch in ("glm", "glm53", "kimi", "deepseek_v4", "deepseek_v41",
+                     "olmoe", "inkling", "qwen36", "qwen38"):
+            for function in ("search", ["search"], 5):
+                with self.subTest(arch=arch, function=function):
+                    with patch("openai_server.ARCH", arch):
+                        with self.assertRaises(HTTPError) as caught:
+                            self.request("/v1/chat/completions", {
+                                "model": "test-model",
+                                "messages": [{"role": "user", "content": "hi"}],
+                                "tools": tools,
+                                "tool_choice": {"type": "function", "function": function}})
+                    self.addCleanup(caught.exception.close)
+                    self.assertEqual(caught.exception.code, 400)
+        # /v1/completions has no renderer in front of generation_options, so it
+        # reached the same read directly.
+        with self.assertRaises(HTTPError) as caught:
+            self.request("/v1/completions", {
+                "model": "test-model", "prompt": "hi", "tools": tools,
+                "tool_choice": {"type": "function", "function": "search"}})
+        self.addCleanup(caught.exception.close)
+        self.assertEqual(caught.exception.code, 400)
+
+    def test_a_well_formed_forced_tool_choice_still_runs(self):
+        """The read above must not change the shape clients actually send."""
+        with self.request("/v1/chat/completions", {
+                "model": "test-model",
+                "messages": [{"role": "user", "content": "hi"}],
+                "tools": [{"type": "function", "function": {"name": "search"}}],
+                "tool_choice": {"type": "function",
+                                "function": {"name": "search"}}}) as response:
+            self.assertEqual(response.status, 200)
+        self.assertIn("You must call the function `search`", self.engine.calls[-1][0])
+        # The OpenAI-legacy spelling {"type": "function", "name": ...} still
+        # forces the tool: _tool_choice_name keeps that fallback.
+        with self.request("/v1/chat/completions", {
+                "model": "test-model",
+                "messages": [{"role": "user", "content": "hi"}],
+                "tools": [{"type": "function", "function": {"name": "search"}}],
+                "tool_choice": {"type": "function", "name": "search"}}) as response:
+            self.assertEqual(response.status, 200)
+        self.assertIn("You must call the function `search`", self.engine.calls[-1][0])
+
 
 class ClientHangupTest(unittest.TestCase):
     """A client that disconnects mid-response must not print a traceback.
@@ -2042,6 +2163,44 @@ class ThinkingSplitUnitTest(unittest.TestCase):
         with patch("openai_server.ARCH", "glm"):
             self.assertFalse(srv.starts_in_reasoning(False),
                              "GLM-5.2 closes the block in the prompt when thinking is off")
+
+    def test_glm53_bare_tool_call_turn_matches_what_the_model_wrote(self):
+        """#1576: a replayed assistant turn has to be the tokens the model made.
+
+        The official template writes "\\n<tool_call>" and GLM-5.3 does not: on a
+        turn that is nothing but a tool call it writes "</think><tool_call>".
+        Rendering the newline anyway put one extra token into the replayed
+        prefix, and the reuse gate in glm53.c is all-or-nothing, so the entire
+        cached prefix went and the turn re-prefilled from scratch. The reporter
+        measured twenty minutes of it on a 3k-token agent history.
+
+        The turn that also carries text keeps its newline, and that is not an
+        oversight: there the model's own trailing newline is stripped and put
+        back, the tokens line up, and it is the case that works today.
+        """
+        import openai_server as srv
+        bare = srv.render_chat_glm53([
+            {"role": "user", "content": "list the files"},
+            {"role": "assistant", "content": "",
+             "tool_calls": [{"type": "function",
+                             "function": {"name": "bash",
+                                          "arguments": '{"command": "ls"}'}}]},
+            {"role": "tool", "content": "a.txt"},
+        ])
+        self.assertIn("</think><tool_call>bash", bare,
+                      "a bare tool call must follow </think> with no newline")
+        self.assertNotIn("</think>\n<tool_call>", bare)
+
+        with_text = srv.render_chat_glm53([
+            {"role": "user", "content": "list the files"},
+            {"role": "assistant", "content": "Let me look.",
+             "tool_calls": [{"type": "function",
+                             "function": {"name": "bash",
+                                          "arguments": '{"command": "ls"}'}}]},
+            {"role": "tool", "content": "a.txt"},
+        ])
+        self.assertIn("Let me look.\n<tool_call>bash", with_text,
+                      "a turn with text keeps the separator it already had")
 
     def test_missing_close_tag_surfaces_reasoning(self):
         self.assertEqual(split_thinking_reply("thought with no end"),
