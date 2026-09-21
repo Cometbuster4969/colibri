@@ -639,6 +639,11 @@ typedef struct {
     float *dn_dtbias, *dn_alog;            /* dt_bias[vh], A_log[vh] */
     float *dn_norm;                        /* RMSNormGated weight [vdim] */
     float *dn_out;                         /* out_proj [hidden, value_dim] */
+    /* VRAM copies the tier placed (qt_dense handle + 1, 0 = stays on the CPU):
+     * the DeltaNet out_proj, the attention q/k/v/o and the shared expert's
+     * three matrices. Offered per layer as "dnout", "attnproj", "shexp";
+     * see trunk_offer_dense / trunk_place_dense. */
+    int qth_dnout, qth_q, qth_k, qth_v, qth_o, qth_shg, qth_shu, qth_shd;
 } Layer;
 
 /* ---------- LRU expert cache (int8 weights + per-row float scales) ---------- */
@@ -1037,6 +1042,29 @@ static void matmul_d(float *y, const float *x, const float *W, int S, int I, int
         return;
     }
     matmul(y, x, W, S, I, O);
+}
+/* A dense matrix the tier placed in VRAM (handle+1 kept in the Layer, 0 = CPU):
+ * one GEMV from the device, or 0 and the caller runs matmul_d as before. The
+ * tier turns a failing handle off itself, so the fallback is permanent. */
+static inline int qtd(int hp1, float *y, const float *x, int I, int O){
+    return hp1 > 0 && qt_dense_matmul(hp1 - 1, y, x, I, O);
+}
+/* Bytes of W's dense-i8 copy (int8 rows + per-row scales), 0 when there is
+ * none (COLI_DENSE_I8=0): nothing to offer, the CPU path stands. */
+static size_t qdw_bytes(const float *W){
+    for (int i = 0; i < g_qdw_n; i++)
+        if (g_qdw[i].w == W) return (size_t)g_qdw[i].I * g_qdw[i].O + (size_t)g_qdw[i].O * sizeof(float);
+    return 0;
+}
+/* Upload W's dense-i8 copy to `dev`; handle+1, or 0 when it stays on the CPU. */
+static int qdw_place(const float *W, int dev){
+    if (dev == QT_PLACE_CPU || !W) return 0;
+    for (int i = 0; i < g_qdw_n; i++)
+        if (g_qdw[i].w == W) {
+            int h = qt_dense_init(g_qdw[i].q, g_qdw[i].sc, g_qdw[i].I, g_qdw[i].O, dev);
+            return h >= 0 ? h + 1 : 0;
+        }
+    return 0;
 }
 
 /* rmsnorm over a row of length D (in-place capable: out may == x).
@@ -1796,9 +1824,11 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
     float *q = falloc((int64_t)S*q_out);
     float *k = falloc((int64_t)S*kv_out);
     float *vv= falloc((int64_t)S*kv_out);
-    matmul_d(q, x, l->q, S, D, q_out);
-    matmul_d(k, x, l->k, S, D, kv_out);
-    matmul_d(vv, x, l->v, S, D, kv_out);
+    /* Decode (S == 1): the projections the tier placed answer from VRAM,
+     * one GEMV each; a prompt batch keeps the batched CPU matmul. */
+    if (!(S == 1 && qtd(l->qth_q, q, x, D, q_out)))   matmul_d(q, x, l->q, S, D, q_out);
+    if (!(S == 1 && qtd(l->qth_k, k, x, D, kv_out)))  matmul_d(k, x, l->k, S, D, kv_out);
+    if (!(S == 1 && qtd(l->qth_v, vv, x, D, kv_out))) matmul_d(vv, x, l->v, S, D, kv_out);
     /* split q into query (first hd) and gate (next gate_dim), both per head */
     float *query = falloc((int64_t)S*H*hd);
     float *gate  = falloc((int64_t)S*H*gate_dim);
@@ -1860,7 +1890,7 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
         float g = gate_dim ? gate[o] : 0.f;
         ag[o] = ctx[o] * (1.f / (1.f + expf(-g)));
     }
-    matmul_d(out, ag, l->o, S, H*hd, D);
+    if (!(S == 1 && qtd(l->qth_o, out, ag, H*hd, D))) matmul_d(out, ag, l->o, S, H*hd, D);
     free(q); free(k); free(vv); free(query); free(gate); free(ctx); free(ag);
 }
 
@@ -1893,10 +1923,10 @@ static void qwen_shared_experts_cpu(Model *m, Layer *l, const float *x, int S,
     if (B == 1) {
         for (int s=0;s<S;s++) {
             const float *xs=x+(int64_t)s*D;
-            matmul_d(g,xs,l->sh_g,1,D,I);
-            matmul_d(u,xs,l->sh_u,1,D,I);
+            if(!qtd(l->qth_shg,g,xs,D,I)) matmul_d(g,xs,l->sh_g,1,D,I);
+            if(!qtd(l->qth_shu,u,xs,D,I)) matmul_d(u,xs,l->sh_u,1,D,I);
             for(int i=0;i<I;i++){float sv=g[i];g[i]=(sv/(1.f+expf(-sv)))*u[i];}
-            matmul_d(hh,g,l->sh_d,1,I,D);
+            if(!qtd(l->qth_shd,hh,g,I,D)) matmul_d(hh,g,l->sh_d,1,I,D);
             float sgate=1.f;
             if(l->sh_gate){float sg=0.f;for(int i=0;i<D;i++)sg+=xs[i]*l->sh_gate[i];sgate=1.f/(1.f+expf(-sg));}
             float *os=out+(int64_t)s*D;
@@ -2178,10 +2208,10 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
             {
                 double _ts2 = tm_now();
                 int Ish = c->shared_inter;
-                matmul_d(sh, xs, l->sh_g, 1, D, Ish);
-                matmul_d(shu, xs, l->sh_u, 1, D, Ish);
+                if (!qtd(l->qth_shg, sh, xs, D, Ish))  matmul_d(sh, xs, l->sh_g, 1, D, Ish);
+                if (!qtd(l->qth_shu, shu, xs, D, Ish)) matmul_d(shu, xs, l->sh_u, 1, D, Ish);
                 for (int i = 0; i < Ish; i++) { float sv = sh[i]; sh[i] = (sv / (1.f + expf(-sv))) * shu[i]; }
-                matmul_d(shd, sh, l->sh_d, 1, Ish, D);
+                if (!qtd(l->qth_shd, shd, sh, Ish, D)) matmul_d(shd, sh, l->sh_d, 1, Ish, D);
                 float sgate = 1.f;
                 if (l->sh_gate) {
                     float sg = 0.f; const float *wg = l->sh_gate;
@@ -2370,7 +2400,8 @@ static void deltanet(Model *m, Layer *l, int layer, float *x, int S, int pos_bas
                 outr[(int64_t)h * vdim + d] = val * zr[d] / (1.f + expf(-zr[d]));
             }
         }
-        matmul_d(out + (int64_t)s * H, outr, l->dn_out, 1, value_dim, H);
+        if (!qtd(l->qth_dnout, out + (int64_t)s * H, outr, value_dim, H))
+            matmul_d(out + (int64_t)s * H, outr, l->dn_out, 1, value_dim, H);
         if (tm_on() && S==1){ g_dn_sub[3]+=tm_now()-_d0; }
         if (layer == 0 && s == 0 && getenv("DN_DBG")) {
             FILE *dbg = fopen(getenv("DN_DBG"), "wb");
@@ -2392,6 +2423,67 @@ static void deltanet(Model *m, Layer *l, int layer, float *x, int S, int pos_bas
     free(qkvz);   /* qkv and z are regions of this one allocation */
     free(b); free(a); free(beta); free(gg);
     free(conv_out); free(q); free(k); free(outv); free(outr); free(kv); free(delta);
+}
+
+/* The rest of the dense trunk, offered to the placer by name and layer with
+ * the bytes of the dense-i8 copies (docs/qwen36-cuda-tier.md, "Placement"):
+ *   dnout    -- the DeltaNet out_proj, one matrix per DeltaNet layer
+ *   attnproj -- q, k, v, o of every attention layer, offered as one item
+ *   shexp    -- gate, up, down of the shared expert, every layer
+ * Measured on ds (CPU, 8 threads): of the 37.5 ms a DeltaNet layer stack
+ * costs per decoded token, 23.4 are the input projections (already placeable
+ * as "dnproj"), 8.3 the out_proj and norm, 3.3 the convolution and 2.4 the
+ * recurrence -- the matmuls are the cost, not the recurrence, so this is
+ * where the trunk goes. Offer order after lmhead and dnproj: dnout, attnproj,
+ * shexp, each in layer order, so a partial placement is whole layers. A
+ * component is offered only when every matrix of it has a dense-i8 copy. */
+static void trunk_offer_dense(Model *m){
+    Cfg *c = &m->c;
+    for (int i = 0; i < c->n_layers; i++) {
+        if (c->is_attn[i]) continue;
+        size_t b = qdw_bytes(m->L[i].dn_out);
+        if (b) qt_trunk_offer("dnout", i, b);
+    }
+    for (int i = 0; i < c->n_layers; i++) {
+        if (!c->is_attn[i]) continue;
+        Layer *l = &m->L[i];
+        size_t bq = qdw_bytes(l->q), bk = qdw_bytes(l->k), bv = qdw_bytes(l->v), bo = qdw_bytes(l->o);
+        if (bq && bk && bv && bo) qt_trunk_offer("attnproj", i, bq + bk + bv + bo);
+    }
+    for (int i = 0; i < c->n_layers; i++) {
+        Layer *l = &m->L[i];
+        size_t bg = qdw_bytes(l->sh_g), bu = qdw_bytes(l->sh_u), bd = qdw_bytes(l->sh_d);
+        if (bg && bu && bd) qt_trunk_offer("shexp", i, bg + bu + bd);
+    }
+}
+/* After qt_init decided: upload what was placed, keep the handles in the
+ * Layer. Every matrix falls back on its own, so a failed upload costs one
+ * GEMV on the CPU, never the component. Returns the number of matrices
+ * placed; `vram_bytes` gets their size. */
+static int trunk_place_dense(Model *m, double *vram_bytes){
+    Cfg *c = &m->c; int placed = 0; double vram = 0;
+    for (int i = 0; i < c->n_layers; i++) {
+        Layer *l = &m->L[i];
+        if (!c->is_attn[i]) {
+            l->qth_dnout = qdw_place(l->dn_out, qt_place_of("dnout", i));
+            if (l->qth_dnout) { placed++; vram += (double)qdw_bytes(l->dn_out); }
+        } else {
+            int dev = qt_place_of("attnproj", i);
+            l->qth_q = qdw_place(l->q, dev); l->qth_k = qdw_place(l->k, dev);
+            l->qth_v = qdw_place(l->v, dev); l->qth_o = qdw_place(l->o, dev);
+            if (l->qth_q) { placed++; vram += (double)qdw_bytes(l->q); }
+            if (l->qth_k) { placed++; vram += (double)qdw_bytes(l->k); }
+            if (l->qth_v) { placed++; vram += (double)qdw_bytes(l->v); }
+            if (l->qth_o) { placed++; vram += (double)qdw_bytes(l->o); }
+        }
+        int dev = qt_place_of("shexp", i);
+        l->qth_shg = qdw_place(l->sh_g, dev); l->qth_shu = qdw_place(l->sh_u, dev); l->qth_shd = qdw_place(l->sh_d, dev);
+        if (l->qth_shg) { placed++; vram += (double)qdw_bytes(l->sh_g); }
+        if (l->qth_shu) { placed++; vram += (double)qdw_bytes(l->sh_u); }
+        if (l->qth_shd) { placed++; vram += (double)qdw_bytes(l->sh_d); }
+    }
+    if (vram_bytes) *vram_bytes = vram;
+    return placed;
 }
 
 static void layers_forward_range(Model *m, float *x, int S, int pos_base,
@@ -3496,6 +3588,7 @@ int main(int argc, char **argv) {
             if (have == 2)
                 qt_trunk_offer("dnproj", i, (size_t)(O_qkv + O_z) * m.c.hidden + (size_t)(O_qkv + O_z) * sizeof(float));
         }
+        trunk_offer_dense(&m);   /* dnout, attnproj, shexp: the rest of the per-token dense work */
     }
     if (qt_init(m.c.n_layers, m.c.n_experts, m.c.hidden, m.c.inter, cap, m.c.topk,
                 m.c.expert_gs, expert_is_int4)) {
@@ -3542,6 +3635,15 @@ int main(int argc, char **argv) {
             }
             if (placed)
                 fprintf(stderr, "[dnp] %d DeltaNet-Projektionen auf GPU (%.2f GB VRAM)\n",
+                        placed, vram / 1073741824.0);
+        }
+        /* The rest of the trunk, wherever the placer put it: out_proj,
+         * attention projections, shared expert. Handles live in the Layer. */
+        {
+            double vram = 0;
+            int placed = trunk_place_dense(&m, &vram);
+            if (placed)
+                fprintf(stderr, "[dense] %d trunk matrices on GPU (dnout/attnproj/shexp, %.2f GB VRAM)\n",
                         placed, vram / 1073741824.0);
         }
         /* Warmstart: fill the VRAM budget BEFORE the first token (heat order

@@ -531,7 +531,7 @@ int qt_init(int nl, int ne, int D, int Ih, int cap, int topk, int expert_gs,
      * the caller repeat every device in COLI_GPUS as well -- forgetting that
      * would silently drop a component back to the CPU mid-A/B. */
     {
-        static const char *comps[] = {"lmhead","dnproj","dnout","attnproj"};
+        static const char *comps[] = {"lmhead","dnproj","dnout","attnproj","shexp"};
         for(size_t ci=0; ci<sizeof comps/sizeof *comps; ci++)
             for(int l=0; l<nl && G.ndev<QT_MAX_DEV; l++){
                 int d=qt_place_of(comps[ci],l);
@@ -650,7 +650,7 @@ int qt_init(int nl, int ne, int D, int Ih, int cap, int topk, int expert_gs,
             else fprintf(stderr,"[qtier] lm_head-Device %d nicht verfuegbar -> CPU\n",ld);
         }
         /* every other component's devices, deduplicated */
-        static const char *comps[] = {"dnproj","dnout","attnproj"};
+        static const char *comps[] = {"dnproj","dnout","attnproj","shexp"};
         for(size_t ci=0; ci<sizeof comps/sizeof *comps; ci++)
             for(int l=0; l<nl; l++){
                 int d=qt_place_of(comps[ci],l);
