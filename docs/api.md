@@ -293,31 +293,35 @@ dashboard on the same port. On a headless host (no display, often no GPU at all)
 use `coli serve`, or `coli web --no-browser`, and point a browser at it from
 another machine. Nothing in the dashboard needs a desktop session on the host.
 
-What you get:
+What you get is one workspace with a dock to switch page:
 
-- **Chat** with live metrics: a flashing token counter while generating, then
-  tok/s, time-to-first-token, prompt→completion counts and queue wait;
-- **Runtime panel**: your hardware (CPU, GPUs + VRAM, RAM, cores), the
-  scheduler, and the live expert-tier bar — how many of the 19,456 experts sit
-  in VRAM / RAM / disk right now;
-- **Brain**: the whole model as a 76×256 cortex, one cell per expert. Colour =
-  tier, brightness = routing heat, and the experts routed in each turn flash
-  white and decay — you watch the model think. Hover any cell for its tier,
-  heat and [measured topic affinity](https://github.com/JustVugg/colibri/issues/175);
-- **Atlas**: the measured expert atlas as a 3-D galaxy (publish `experts.json`
-  from `tools/expert_atlas/analyze.py --web`).
+- **Chat**: streaming answers, a reasoning toggle, image input where the engine
+  supports it, the KV slot to answer in, and the conversation exported as a file;
+- **Brio**: closed-set answers. A document, a question and the only answers
+  allowed; the engine reads the probability of each answer, generates nothing,
+  and reports an entropy that says when it is not sure. Same thing as
+  `POST /v1/brio` (see [brio.md](brio.md));
+- **Brain**, two views. *Explore* draws the
+  [measured expert atlas](https://github.com/JustVugg/colibri/issues/175) of GLM-5.2 as a cortex with ten regions to
+  enter (publish `experts.json` from `tools/expert_atlas/analyze.py --web`).
+  *Live routing* shows the model actually running: one cell per expert,
+  colour = tier, brightness = routing heat, and the experts routed in each
+  turn flash white and decay;
+- **Profiling**: where the engine spends each turn, by phase (I/O wait, expert
+  matmul, attention, LM head, other), the disk service overlapped with compute,
+  and the last 30 turns as a trend;
+- a light and a dark theme.
 
 The dashboard talks to the engine over a small line protocol and plain JSON
 endpoints — nothing heavier than the engine itself. `web/` is a pure OpenAI-API
 client (React + TypeScript) and also works against any other compatible
 endpoint; the terminal `coli chat` remains the first-class interface.
 
-The layout is responsive down to phone widths, and the sidebar carries the full
-telemetry stack — hardware, scheduler, tier bar, per-turn time breakdown, tok/s
-trend and per-GPU expert counts:
+The layout is responsive down to phone widths; the per-turn time breakdown and
+the tok/s trend live on the Profiling page:
 
 <p align="center">
   <img src="media/colibri-mobile.png" width="270" alt="the dashboard on a phone-sized viewport" />
   &nbsp;&nbsp;
-  <img src="media/colibri-metrics.png" width="300" alt="the telemetry sidebar" />
+  <img src="media/colibri-profiling.png" width="560" alt="the Profiling page: where the engine spends each turn" />
 </p>
