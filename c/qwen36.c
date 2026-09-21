@@ -2486,6 +2486,57 @@ static int trunk_place_dense(Model *m, double *vram_bytes){
     return placed;
 }
 
+/* Measured, not assumed. The placer prices a trunk component by the bytes it
+ * saves on the CPU's memory bus, which presumes the GPU answers a GEMV faster
+ * than the CPU does. Four Tesla M10 (sm_50) said otherwise: every placed
+ * component ran slower there, lm_head 68.8 ms against 41.7 on the CPU, and
+ * decode fell from 3.56 to 2.68 tok/s (#1652). So before any trunk upload,
+ * one DeltaNet input projection (the most numerous placed matrix) is timed
+ * both ways on the device that would host it, ten GEMVs each, best of three
+ * rounds after a warm-up, and the trunk goes to VRAM only if the GPU wins.
+ * Only the automatic placement is questioned: a hand-written COLI_PLACE
+ * stands. COLI_TRUNK_PROBE=0 skips the probe and trusts the placer. The
+ * probe's copy stays resident (one projection, ~25 MB on the 35B). */
+static int trunk_probe_gpu_wins(Model *m){
+    const char *e = getenv("COLI_TRUNK_PROBE");
+    if (e && *e == '0') return 1;
+    if (!qt_place_is_auto()) return 1;
+    Cfg *c = &m->c;
+    int qi = -1, dev = QT_PLACE_CPU;
+    for (int i = 0; i < c->n_layers && qi < 0; i++) {
+        if (c->is_attn[i]) continue;
+        for (int j = 0; j < g_qdw_n; j++)
+            if (g_qdw[j].w == m->L[i].dn_qkv) { qi = j; dev = qt_place_of("dnproj", i); break; }
+    }
+    if (qi < 0) return 1;                            /* dense-i8 off: nothing will be placed */
+    if (dev == QT_PLACE_CPU) dev = qt_place_of("lmhead", 0);
+    if (dev == QT_PLACE_CPU) return 1;               /* nothing placed: nothing to measure */
+    int I = g_qdw[qi].I, O = g_qdw[qi].O;
+    int h = qt_dense_init(g_qdw[qi].q, g_qdw[qi].sc, I, O, dev);
+    if (h < 0) return 1;                             /* cannot measure: the placer's word stands */
+    float *x = malloc((size_t)I * sizeof(float)), *y = malloc((size_t)O * sizeof(float));
+    if (!x || !y) { free(x); free(y); return 1; }
+    for (int i = 0; i < I; i++) x[i] = sinf(0.37f * (float)i);
+    double gpu = 1e30, cpu = 1e30;
+    for (int r = 0; r < 3; r++) {
+        for (int k = 0; k < 3; k++) if (!qt_dense_matmul(h, y, x, I, O)) { free(x); free(y); return 1; }
+        double t0 = now_s();
+        for (int k = 0; k < 10; k++) if (!qt_dense_matmul(h, y, x, I, O)) { free(x); free(y); return 1; }
+        double tg = (now_s() - t0) / 10;
+        for (int k = 0; k < 3; k++) matmul_q(y, x, g_qdw[qi].q, g_qdw[qi].sc, I, O);
+        t0 = now_s();
+        for (int k = 0; k < 10; k++) matmul_q(y, x, g_qdw[qi].q, g_qdw[qi].sc, I, O);
+        double tc = (now_s() - t0) / 10;
+        if (tg < gpu) gpu = tg;
+        if (tc < cpu) cpu = tc;
+    }
+    free(x); free(y);
+    int wins = gpu < cpu;
+    fprintf(stderr, "[place] probe: one [%d x %d] int8 GEMV takes %.3f ms on CUDA dev %d, %.3f ms on the CPU -> trunk %s\n",
+            O, I, gpu * 1e3, dev, cpu * 1e3, wins ? "to VRAM" : "stays on the CPU");
+    return wins;
+}
+
 static void layers_forward_range(Model *m, float *x, int S, int pos_base,
                                  int layer_begin, int layer_end,
                                  int allow_prefetch, FILE *lf) {
@@ -3594,6 +3645,8 @@ int main(int argc, char **argv) {
                 m.c.expert_gs, expert_is_int4)) {
         fprintf(stderr, "[gpu] MoE experts -> CUDA VRAM tier\n");
         atexit(qt_shutdown);
+        /* The placer predicted; measure before uploading a byte of trunk. */
+        if (!trunk_probe_gpu_wins(&m)) qt_trunk_withdraw("measured slower than the CPU");
         /* R4 role split: park the dense-i8 lm_head on COLI_LMHEAD_GPU. The
          * qdw entry keyed by m.lm_head holds the int8 rows + per-row scales
          * the CPU path uses; the GPU applies the identical semantics. */

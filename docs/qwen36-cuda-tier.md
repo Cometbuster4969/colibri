@@ -81,8 +81,21 @@ on a CPU without AVX2; measured on a 16-core CPU, of the 37.5 ms a decoded
 token spends in the DeltaNet stack 23.4 are the input projections, 8.3 the
 out_proj and norm, 3.3 the convolution and 2.4 the recurrence -- the matmuls,
 not the recurrence, are what the trunk costs. They are served from VRAM on
-decode (one GEMV each); a prompt batch keeps the batched CPU matmul. The
-pricing rule:
+decode (one GEMV each); a prompt batch keeps the batched CPU matmul.
+
+**Measured, not assumed.** The pricing rule below presumes the GPU answers a
+GEMV faster than the CPU does. Four Tesla M10 (sm_50, no tensor cores, four
+GPUs on one PCIe board) said otherwise in #1652: with every expert
+VRAM-resident, placing the trunk made every component slower (lm_head 68.8 ms
+against 41.7 on the CPU, the 30 DeltaNet projections 106 against 66) and
+decode fell from 3.56 to 2.68 tok/s. So the engine measures before it uploads
+a byte of trunk: one DeltaNet input projection is timed both ways on the
+device that would host it (ten GEMVs, best of three rounds, after a warm-up),
+one `[place] probe:` line reports both times, and if the GPU loses the whole
+automatic placement is withdrawn (`[place] trunk stays on the CPU`) and its
+bytes go back to the expert budget before the warmstart. Only the automatic
+placement is questioned: a hand-written `COLI_PLACE` stands, and
+`COLI_TRUNK_PROBE=0` skips the probe. The pricing rule:
 
 - a dense component is read every token: 1.0 per byte;
 - a routed expert is read with the probability a token routes to it -- its heat

@@ -408,6 +408,29 @@ static double auto_displaced_value(int di, size_t room, int k, size_t exp_bytes,
     return value;
 }
 
+/* Whether the trunk placement is the automatic one (COLI_PLACE unset or
+ * "auto"): the only decision the engine's startup probe may overturn. A
+ * hand-written list, or "off", is the user's word and stands. */
+int qt_place_is_auto(void){ return G_auto_on && auto_mode(); }
+
+/* Undo the automatic trunk placement: every offer back to the CPU, lm_head and
+ * the DeltaNet projections included, and the bytes it had taken back into each
+ * device's expert budget. The engine calls this BEFORE any trunk upload, when
+ * its startup probe measured the GPU GEMV slower than the CPU's: on four Tesla
+ * M10 every placed component lost, lm_head 68.8 ms against 41.7 on the CPU,
+ * decode 2.68 against 3.56 tok/s (#1652). Nothing to undo when the placement
+ * was not automatic. */
+void qt_trunk_withdraw(const char *why){
+    if(!qt_place_is_auto()) return;
+    size_t back = 0;
+    for(int o = 0; o < G_offer_n; o++) G_offer[o].dev = QT_PLACE_CPU;
+    G_auto_lmh = QT_PLACE_CPU; G_lmh.dev_ok = 0;
+    for(int l = 0; l < QT_DN_MAX_LAYERS; l++) G_auto_dnp[l] = QT_PLACE_CPU;
+    for(int i = 0; i < G.ndev; i++){ back += G_trunk_bytes[i]; G.budget[i] += G_trunk_bytes[i]; G_trunk_bytes[i] = 0; }
+    fprintf(stderr,"[place] trunk stays on the CPU (%s): %.2f GB of VRAM back to the experts\n",
+            why ? why : "withdrawn", back/1073741824.0);
+}
+
 static void auto_place(int nl, int ne, int topk, const size_t *capacity, const uint32_t *heat0){
     size_t room[QT_MAX_DEV];
     for(int i = 0; i < G.ndev; i++){ room[i] = capacity[i]; G_trunk_bytes[i] = 0; }
